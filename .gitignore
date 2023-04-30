@@ -1,3 +1,13 @@
-/data/scannet
+# dataset
+
+/data/scannet/scans
+/data/scannet/scans_test
+/data/scannet/scannet_data
 /data/scanrefer
+
+# cache
+/data/scannet/__pycache__
+
+# Pycharm IDE
+/.idea
 
