@@ -1,12 +1,18 @@
 # dataset
-
 /data/scannet/scans
 /data/scannet/scans_test
 /data/scannet/scannet_data
 /data/scanrefer
 
+# language related
+/data/glove.p
+/data/Scanrefer_vocabulary.json
+/data/Scanrefer_vocabulary_weights.json
+
 # cache
 /data/scannet/__pycache__
+/lib/__pycache__
+/utils/__pycache__
 
 # Pycharm IDE
 /.idea
