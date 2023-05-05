@@ -1,0 +1,7 @@
+# ninja log v5
+0	11953	1683104335663918279	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/softgroup_ops.o	43ced321c3e52a63
+0	13457	1683104337167918232	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/softgroup_api.o	a0b41bfb46bc565a
+1	18248	1683104341959918082	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/cuda.o	e4c4fd0487fafc3f
+14	12220	1683104354583917688	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/softgroup_ops.o	d3dc3bbe2a6cd294
+13	13767	1683104356127917640	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/softgroup_api.o	923ac706ea56d41
+14	18302	1683104360663917498	/home/luk/SoftGroup/build/temp.linux-x86_64-3.7/softgroup/ops/src/cuda.o	4f5854f9dd5566b1

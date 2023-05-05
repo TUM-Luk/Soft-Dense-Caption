@@ -6,7 +6,7 @@ CONF = EasyDict()
 
 # path
 CONF.PATH = EasyDict()
-CONF.PATH.BASE = 'C:/Users/luyun/DenseCap'  # TODO: change this
+CONF.PATH.BASE = '/home/luk/DenseCap'  # TODO: change this
 CONF.PATH.DATA = os.path.join(CONF.PATH.BASE, 'data')
 CONF.PATH.SCANNET = os.path.join(CONF.PATH.DATA, "scannet")
 CONF.PATH.LIB = os.path.join(CONF.PATH.BASE, "lib")
@@ -24,3 +24,12 @@ CONF.TRAIN.MAX_DES_LEN = 30
 
 # no used
 CONF.MULTIVIEW = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats_maxpool.hdf5")
+
+# voxel_cfg
+CONF.voxel_cfg = EasyDict()
+CONF.voxel_cfg.scale = 50
+CONF.voxel_cfg.spatial_shape = [128,512]
+CONF.voxel_cfg.max_npoint = 250000
+CONF.voxel_cfg.min_npoint = 5000
+
+
