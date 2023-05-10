@@ -13,6 +13,9 @@
 /data/scannet/__pycache__
 /lib/__pycache__
 /utils/__pycache__
+/model/__pycache__
+
+
 
 # Pycharm IDE
 /.idea

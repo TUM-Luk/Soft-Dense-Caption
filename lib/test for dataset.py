@@ -22,24 +22,15 @@ from data.scannet.model_util_scannet import rotate_aligned_boxes, ScannetDataset
 
 # for model
 from model.softgroup import SoftGroup
+from model.proposal_module import ProposalModule
+from model.caption_module import CaptionModule
 import torch
 
 from dataset import get_scanrefer
 
-
 DC = ScannetDatasetConfig()
 
-file = '/home/luk/Downloads/softgroup_scannet_spconv2.pth'
-net = torch.load(file)
-
-train_model = SoftGroup().cuda()
-train_model.load_state_dict(net['net'], strict=True)
-
-print('AAAAAAAAAAAAAAAAAAA')
-
 new_scanrefer_train, new_scanrefer_eval_train, new_scanrefer_eval_val, all_scene_list = get_scanrefer(model='')
-
-
 
 dataset = ScannetReferenceDataset(
     scanrefer=new_scanrefer_train,
@@ -55,9 +46,41 @@ dataset = ScannetReferenceDataset(
     scan2cad_rotation=False
 )
 
-dataloader_train = DataLoader(dataset, batch_size=2, shuffle=True, collate_fn=dataset.collate_fn)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+dataloader_train = DataLoader(dataset, batch_size=4, shuffle=True, collate_fn=dataset.collate_fn)
+
+soft_model = SoftGroup().cuda()
+file = '/home/luk/Downloads/epoch_10.pth'
+net = torch.load(file)
+soft_model.load_state_dict(net['net'], strict=True)
+
+proposal_model = ProposalModule().cuda()
+caption_model = CaptionModule(dataset.vocabulary,dataset.glove).cuda()
+
+print(dataset.vocabulary['word2idx'])
 
 for batch in dataloader_train:
-    print(train_model.forward(batch,return_loss=True))
-    print(batch['semantic_labels'][0])
+    batch['clus_feats_batch'], batch['select_feats'], batch['losses'] = soft_model.forward(batch,return_loss=True)
+    proposal_model.forward(batch)
+    print(batch['pred_bboxes'])
+    caption_model.forward(batch)
+    print(batch['lang_cap'])
+    print(batch['lang_cap'].shape)
     break
+#
+# for batch in dataloader_train:
+#     print(batch['object_id'])
+#     print(batch['object_id'].shape)
+#     print(batch['lang_feat'])
+#     print(batch['lang_feat'].shape)
+#     print(batch['lang_len'])
+#     print(batch['lang_len'].shape)
+#     print(batch['lang_ids'])
+#     print(batch['lang_ids'].shape)
+#     break
+
+
+# print(dataset[0]['instance_label'].max())
+# print(dataset[0]['inst_num'])
+# print(dataset[0]['instance_bboxes'][:,-1].max())

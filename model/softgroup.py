@@ -16,6 +16,8 @@ from .blocks import MLP, ResidualBlock, UBlock
 
 from easydict import EasyDict
 
+from lib.config import CONF
+
 
 class SoftGroup(nn.Module):
 
@@ -30,10 +32,10 @@ class SoftGroup(nn.Module):
                  sem2ins_classes=[],
                  ignore_label=-100,
                  with_coords=True,
-                 grouping_cfg=None,
-                 instance_voxel_cfg=None,
-                 train_cfg=None,
-                 test_cfg=None,
+                 grouping_cfg=CONF.grouping_cfg,
+                 instance_voxel_cfg=CONF.instance_voxel_cfg,
+                 train_cfg=CONF.train_cfg,
+                 test_cfg=CONF.test_cfg,
                  fixed_modules=[]):
         super().__init__()
         self.in_channels = in_channels
@@ -51,15 +53,6 @@ class SoftGroup(nn.Module):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.fixed_modules = fixed_modules
-
-        self.train_cfg=EasyDict()
-        self.train_cfg.max_proposal_num=200
-        self.test_cfg = EasyDict()
-        self.test_cfg.min_npoint = 100
-        self.instance_voxel_cfg=EasyDict()
-        self.instance_voxel_cfg.scale=50
-        self.instance_voxel_cfg.spatial_shape=20
-
 
         block = ResidualBlock
         norm_fn = functools.partial(nn.BatchNorm1d, eps=1e-4, momentum=0.1)
@@ -120,56 +113,69 @@ class SoftGroup(nn.Module):
         else:
             return self.forward_test(**batch)
 
+    def select_feat(self,proposals_idx, proposal_each_scene, instance_labels, object_id, batch_size):
+        proposal_id_offset = np.zeros(batch_size + 1).astype(np.int64)
+        for i in range(batch_size + 1):
+            proposal_id_offset[i] = sum(proposal_each_scene[0:i])
+        # print(proposal_id_offset)
+        proposal_num = proposals_idx[:, 0].max() + 1  # proposal总数量
+        npoint = int(instance_labels.shape[0] / batch_size)  # 每个batch中点的数量，例如40000
+
+        # 获取该batch中的ref_cluster (B,npoint) 如（4，40000）,为节约内存用bytetensor
+        ref_cluster = torch.zeros((batch_size, npoint)).byte()
+        for i in range(batch_size):
+            ref_cluster[i, :] = (instance_labels[npoint * i:npoint * (i + 1)] == object_id[i])
+        # print(ref_cluster)
+
+        # 获取全部proposal的cluster (N,npoint) 如 (512,40000)
+        proposal_cluster = torch.zeros((proposal_num, npoint)).byte()
+        for [i, j] in proposals_idx:
+            proposal_cluster[i, j % npoint] = 1
+        # print(proposal_cluster)
+
+        # 作iou选取和ref_cluster最接近的
+        select_proposal_idx = torch.zeros(batch_size).int()
+        for i in range(batch_size):
+            ref = ref_cluster[i]
+            iou_score = (proposal_cluster[proposal_id_offset[i]:proposal_id_offset[i + 1], :] * ref).sum(1) / (
+                    proposal_cluster[proposal_id_offset[i]:proposal_id_offset[i + 1], :].sum(1) + ref.sum() - (
+                    proposal_cluster[proposal_id_offset[i]:proposal_id_offset[i + 1], :] * ref).sum(1))
+            # print(iou_score)
+            # print(iou_score.argmax())
+            # print("最匹配的cluster的下标为:", iou_score.argmax() + proposal_id_offset[i])
+            select_proposal_idx[i] = iou_score.argmax() + proposal_id_offset[i]
+        return select_proposal_idx, proposal_id_offset
+
     @cuda_cast
     def forward_train(self, batch_idxs, voxel_coords, p2v_map, v2p_map, coords_float, feats,
                       semantic_labels, instance_labels, instance_pointnum, instance_cls,
-                      pt_offset_labels, spatial_shape, batch_size, **kwargs):
+                      pt_offset_labels, spatial_shape, batch_size, object_id, **kwargs):
         losses = {}
         if self.with_coords:
             feats = torch.cat((feats, coords_float), 1)
         voxel_feats = voxelization(feats, p2v_map)
+
         input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
         semantic_scores, pt_offsets, output_feats = self.forward_backbone(input, v2p_map)
-        print("!!!!!!!!!!!!!!!")
         print(semantic_scores)
         print(semantic_scores.shape)
-        print(semantic_scores[0])
-
 
         # point wise losses
         point_wise_loss = self.point_wise_loss(semantic_scores, pt_offsets, semantic_labels,
                                                instance_labels, pt_offset_labels)
         losses.update(point_wise_loss)
 
-        print(point_wise_loss)
-
-        self.grouping_cfg = EasyDict()
-        self.grouping_cfg.radius = 0.04
-        self.grouping_cfg.score_thr = 0.2
-        self.grouping_cfg.mean_active = 300
-        self.grouping_cfg.npoint_thr = 0.05
-        self.grouping_cfg.class_numpoint_mean = [-1., -1., 3917., 12056., 2303.,
-                                                 8331., 3948., 3166., 5629., 11719.,
-                                                 1003., 3317., 4912., 10221., 3889.,
-                                                 4136., 2120., 945., 3967., 2589.]
-        self.grouping_cfg.ignore_classes = [0,1]
-
         # instance losses
         if not self.semantic_only:
-            proposals_idx, proposals_offset = self.forward_grouping(semantic_scores, pt_offsets,
-                                                                    batch_idxs, coords_float,
-                                                                    self.grouping_cfg)
-            print(proposals_idx)
-            print(proposals_idx.shape)
-            print(proposals_offset)
-            print(proposals_offset.shape)
+            proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(semantic_scores, pt_offsets,
+                                                                                         batch_idxs, coords_float,
+                                                                                         self.grouping_cfg)
 
+            select_proposal_idx, proposal_id_offset = self.select_feat(proposals_idx, proposal_each_scene, instance_labels, object_id, batch_size)
 
-            if proposals_offset.shape[0] > self.train_cfg.max_proposal_num:
-                proposals_offset = proposals_offset[:self.train_cfg.max_proposal_num + 1]
-                proposals_idx = proposals_idx[:proposals_offset[-1]]
-                assert proposals_idx.shape[0] == proposals_offset[-1]
-
+            # 提取每个instance proposal的feature
+            # 这里的是voxelization之后的，即inst_feat是tiny unet的输入
+            # inst_map是用来devoxelization的map
             inst_feats, inst_map = self.clusters_voxelization(
                 proposals_idx,
                 proposals_offset,
@@ -178,16 +184,36 @@ class SoftGroup(nn.Module):
                 rand_quantize=True,
                 **self.instance_voxel_cfg)
 
-            print("this is inst_feats")
-            print(inst_feats)
-            instance_batch_idxs, cls_scores, iou_scores, mask_scores = self.forward_instance(
-                inst_feats, inst_map)
+            feats = self.tiny_unet(inst_feats)
+            feats = self.tiny_unet_outputlayer(feats)
+            feats = self.global_pool(feats)
 
-            return
-            instance_loss = self.instance_loss(cls_scores, mask_scores, iou_scores, proposals_idx,
-                                               proposals_offset, instance_labels, instance_pointnum,
-                                               instance_cls, instance_batch_idxs)
-            losses.update(instance_loss)
+            print(feats)
+            # 对feats维度进行重构,从(N,32)变为(B,128,32)
+            clus_feats_batch = torch.zeros([batch_size, self.train_cfg.max_proposal_num, feats.shape[1]]).cuda()
+            for i in range(batch_size):
+                clus_feats_batch[i][0:proposal_each_scene[i]] = feats[proposal_id_offset[i]:proposal_id_offset[i + 1]]
+
+            select_feats = torch.zeros([batch_size, feats.shape[1]]).cuda()
+            for i in range(batch_size):
+                select_feats[i] = feats[select_proposal_idx[i]]
+
+            print("所有的cluster features为：")
+            print(clus_feats_batch)
+            print(clus_feats_batch.shape)
+            print("与ref的iou最高的cluster对应的cluster features为")
+            print(select_feats)
+            print(select_feats.shape)
+
+            return clus_feats_batch, select_feats, losses
+
+            # cluster_feats, instance_batch_idxs, cls_scores, iou_scores, mask_scores = self.forward_instance(
+            #     inst_feats, inst_map)
+            #
+            # instance_loss = self.instance_loss(cls_scores, mask_scores, iou_scores, proposals_idx,
+            #                                    proposals_offset, instance_labels, instance_pointnum,
+            #                                    instance_cls, instance_batch_idxs)
+            # losses.update(instance_loss)
         return self.parse_losses(losses)
 
     def point_wise_loss(self, semantic_scores, pt_offsets, semantic_labels, instance_labels,
@@ -413,8 +439,7 @@ class SoftGroup(nn.Module):
             output = self.output_layer(output)
             output_feats = output.features
             if not lvl_fusion:
-                output_feats = output_feats[input_map.long()]
-
+                output_feats = output_feats[input_map.long()]  # devoxelization
         semantic_scores = self.semantic_linear(output_feats)
         pt_offsets = self.offset_linear(output_feats)
         return semantic_scores, pt_offsets, output_feats
@@ -458,6 +483,7 @@ class SoftGroup(nn.Module):
                          coords_float,
                          grouping_cfg=None,
                          lvl_fusion=False):
+        proposal_each_scene = []
         proposals_idx_list = []
         proposals_offset_list = []
         batch_size = batch_idxs.max() + 1
@@ -471,55 +497,77 @@ class SoftGroup(nn.Module):
         class_numpoint_mean = torch.tensor(
             self.grouping_cfg.class_numpoint_mean, dtype=torch.float32)
         assert class_numpoint_mean.size(0) == self.semantic_classes
-        for class_id in range(self.semantic_classes):
-            if class_id in self.grouping_cfg.ignore_classes:
-                continue
-            scores = semantic_scores[:, class_id].contiguous()
-            object_idxs = (scores > self.grouping_cfg.score_thr).nonzero().view(-1)
-            # if object_idxs.size(0) < self.test_cfg.min_npoint:
-            if object_idxs.size(0) < 100:
-                continue
-            batch_idxs_ = batch_idxs[object_idxs]
-            coords_ = coords_float[object_idxs]
-            pt_offsets_ = pt_offsets[object_idxs]
-            if with_pyramid:
-                num_points = coords_.size(0)
-                level = self.get_level(num_points)
-                radius = self.grouping_cfg.radius * level
-                if level > 1 or not lvl_fusion:
-                    coords_, pt_offsets_, batch_idxs_, l2p_map = self.pyramid_map(
-                        coords_, pt_offsets_, batch_idxs_, level, base_size)
-            batch_offsets_ = self.get_batch_offsets(batch_idxs_, batch_size)
-            neighbor_inds, start_len = ball_query(
-                coords_ + pt_offsets_,
-                batch_idxs_,
-                batch_offsets_,
-                radius,
-                mean_active,
-                with_octree=with_octree)
-            proposals_idx, proposals_offset = bfs_cluster(class_numpoint_mean, neighbor_inds.cpu(),
-                                                          start_len.cpu(), npoint_thr, class_id)
-            if with_pyramid:
-                if level > 1 or not lvl_fusion:
-                    proposals_idx, proposals_offset = self.pyramid_inverse_map(
-                        proposals_idx, proposals_offset, coords_.size(0), l2p_map)
-            proposals_idx[:, 1] = object_idxs[proposals_idx[:, 1].long()].int()
 
-            # merge proposals
-            if len(proposals_offset_list) > 0:
-                proposals_idx[:, 0] += sum([x.size(0) for x in proposals_offset_list]) - 1
-                proposals_offset += proposals_offset_list[-1][-1]
-                proposals_offset = proposals_offset[1:]
-            if proposals_idx.size(0) > 0:
-                proposals_idx_list.append(proposals_idx)
-                proposals_offset_list.append(proposals_offset)
+        npoint = (semantic_scores.shape[0] / batch_size).int()  # num of points in one sample/scene
+        max_proposal = 128  # TODO： max proposal per scene (sample)
+        for i in range(batch_size):
+            cur_num = 0  # 记录每个sample中当前group了多少proposal
+            GO_NEXT = False  # 跳过当前sample的flag
+            for class_id in range(self.semantic_classes):
+                if GO_NEXT:
+                    continue
+                if class_id in self.grouping_cfg.ignore_classes:
+                    continue
+                scores = semantic_scores[npoint * i:npoint * (i + 1), class_id].contiguous()
+                object_idxs = (scores > self.grouping_cfg.score_thr).nonzero().view(-1)
+                # if object_idxs.size(0) < self.test_cfg.min_npoint:
+                if object_idxs.size(0) < 100:
+                    continue
+                batch_idxs_ = batch_idxs[npoint * i + object_idxs]
+                coords_ = coords_float[npoint * i + object_idxs]
+                pt_offsets_ = pt_offsets[npoint * i + object_idxs]
+
+                if with_pyramid:
+                    num_points = coords_.size(0)
+                    level = self.get_level(num_points)
+                    radius = self.grouping_cfg.radius * level
+                    if level > 1 or not lvl_fusion:
+                        coords_, pt_offsets_, batch_idxs_, l2p_map = self.pyramid_map(
+                            coords_, pt_offsets_, batch_idxs_, level, base_size)
+
+                batch_offsets_ = self.get_batch_offsets(batch_idxs_, batch_size)  # 表明每个batch之间的分界，如[0,40000,80000]
+                neighbor_inds, start_len = ball_query(
+                    coords_ + pt_offsets_,
+                    batch_idxs_,
+                    batch_offsets_,
+                    radius,
+                    mean_active,
+                    with_octree=with_octree)
+                proposals_idx, proposals_offset = bfs_cluster(class_numpoint_mean, neighbor_inds.cpu(),
+                                                              start_len.cpu(), npoint_thr, class_id)
+                if with_pyramid:
+                    if level > 1 or not lvl_fusion:
+                        proposals_idx, proposals_offset = self.pyramid_inverse_map(
+                            proposals_idx, proposals_offset, coords_.size(0), l2p_map)
+                proposals_idx[:, 1] = object_idxs[proposals_idx[:, 1].long()].int() + npoint * i
+
+                # check if having max clusters, if yes, then crop, merge, and go to next sample
+                cur_num = cur_num + (len(proposals_offset) - 1)
+                if cur_num >= max_proposal:
+                    crop_num = (len(proposals_offset) - 1) - (cur_num - max_proposal)  # 只能取前cur_num个proposal
+                    proposals_offset = proposals_offset[0:crop_num + 1]
+                    proposals_idx = proposals_idx[:proposals_offset[-1], :]
+                    # set flag to go to next sample
+                    cur_num = max_proposal
+                    GO_NEXT = True
+
+                # merge proposals
+                if len(proposals_offset_list) > 0:
+                    proposals_idx[:, 0] += sum([x.size(0) for x in proposals_offset_list]) - 1
+                    proposals_offset += proposals_offset_list[-1][-1]
+                    proposals_offset = proposals_offset[1:]
+                if proposals_idx.size(0) > 0:
+                    proposals_idx_list.append(proposals_idx)
+                    proposals_offset_list.append(proposals_offset)
+            proposal_each_scene.append(cur_num)
+
         if len(proposals_idx_list) > 0:
             proposals_idx = torch.cat(proposals_idx_list, dim=0)
             proposals_offset = torch.cat(proposals_offset_list)
         else:
             proposals_idx = torch.zeros((0, 2), dtype=torch.int32)
             proposals_offset = torch.zeros((0,), dtype=torch.int32)
-        return proposals_idx, proposals_offset
+        return proposals_idx, proposals_offset, proposal_each_scene
 
     def get_level(self, num_points):
         if num_points > 1000000:
@@ -552,19 +600,24 @@ class SoftGroup(nn.Module):
         feats = self.tiny_unet(inst_feats)
         feats = self.tiny_unet_outputlayer(feats)
         print("this is feats after t unet")
-        print(feats)
+        print(feats.indices)
         print(feats.features)
+        instance_batch_idxs = feats.indices[:, 0][inst_map.long()]
 
         # predict mask scores
         mask_scores = self.mask_linear(feats.features)
         mask_scores = mask_scores[inst_map.long()]
-        instance_batch_idxs = feats.indices[:, 0][inst_map.long()]
 
         # predict instance cls and iou scores
         feats = self.global_pool(feats)
+        print("this is feats after pool")
+        print(feats)
+        print(feats.shape)
+
         cls_scores = self.cls_linear(feats)
         iou_scores = self.iou_score_linear(feats)
-        return instance_batch_idxs, cls_scores, iou_scores, mask_scores
+
+        return feats, instance_batch_idxs, cls_scores, iou_scores, mask_scores
 
     @force_fp32(apply_to=('semantic_preds', 'offset_preds'))
     def get_point_wise_results(self, coords_float, color_feats, semantic_preds, offset_preds,

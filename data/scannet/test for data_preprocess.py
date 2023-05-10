@@ -26,7 +26,9 @@ data_aligned_bbox = np.load("scannet_data/{}_aligned_bbox.npy".format(scan_name)
 print('\nbbox.npy stores a numpy array with object bounding box after transformation, it has shape', data_aligned_bbox.shape)
 print("8 means: 6 for bounding box, 1 for label_id, 1 for object_id")
 
-
+point_votes = np.random.rand(10,3)
+point_votes = np.tile(point_votes, (1, 3))
+print(point_votes)
 
 
 

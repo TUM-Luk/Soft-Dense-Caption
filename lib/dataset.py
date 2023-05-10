@@ -9,7 +9,6 @@ import time
 import h5py
 import json
 import pickle
-import random
 import numpy as np
 import multiprocessing as mp
 import torch
@@ -28,18 +27,38 @@ from utils.pc_utils import random_sampling, rotx, roty, rotz
 from utils.box_util import get_3d_box, get_3d_box_batch
 from data.scannet.model_util_scannet import rotate_aligned_boxes, ScannetDatasetConfig, rotate_aligned_boxes_along_axis
 
-from easydict import EasyDict
-from torch import LongTensor
 from copy import deepcopy
 
+# map nyu40id label (1-40) to class label (0-17), wall, floor, ceiling (-100) are NOT considered in cluster grouping
+semantic_map = {
+    22: -100, 0: -100,  # ceiling(22), unannotated(0)
+    1: 0,  # wall
+    2: 1,  # floor
+    3: 2,  # cabinet
+    4: 3,  # bed
+    5: 4,  # chair
+    6: 5,  # sofa
+    7: 6,  # table
+    8: 7,  # door
+    9: 8,  # window
+    10: 9,  # bookshelf
+    11: 10,  # picture
+    12: 11,  # counter
+    14: 12,  # desk
+    16: 13,  # curtain
+    24: 14,  # refrigerator
+    28: 15,  # shower curtain
+    33: 16,  # toilet
+    34: 17,  # sink
+    36: 18,  # bathtub
+    13: 19, 15: 19, 17: 19, 18: 19, 19: 19, 20: 19, 21: 19, 23: 19, 25: 19, 26: 19, 27: 19, 29: 19, 30: 19, 31: 19,
+    32: 19, 35: 19, 37: 19, 38: 19, 39: 19, 40: 19  # other furniture
 
+}
 # data setting
 DC = ScannetDatasetConfig()
 MAX_NUM_OBJ = 128
 MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])
-OBJ_CLASS_IDS = np.array(
-    [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
-     34, 35, 36, 37, 38, 39, 40])  # exclude wall (1), floor (2), ceiling (22)
 
 # data path
 SCANNET_V2_TSV = os.path.join(CONF.PATH.SCANNET_META, "scannetv2-labels.combined.tsv")
@@ -50,6 +69,7 @@ VOCAB_WEIGHTS = os.path.join(CONF.PATH.DATA, "{}_vocabulary_weights.json")  # da
 # MULTIVIEW_DATA = os.path.join(CONF.PATH.SCANNET_DATA, "enet_feats.hdf5")
 MULTIVIEW_DATA = CONF.MULTIVIEW
 GLOVE_PICKLE = os.path.join(CONF.PATH.DATA, "glove.p")
+
 
 def get_scanrefer(model=None):
     scanrefer_train = json.load(open(os.path.join(CONF.PATH.DATA, "scanrefer/ScanRefer_filtered_train.json")))
@@ -94,6 +114,7 @@ def get_scanrefer(model=None):
     print("eval on {} scenes from train and {} scenes from val".format(len(new_scanrefer_eval_train),
                                                                        len(new_scanrefer_eval_val)))
     return new_scanrefer_train, new_scanrefer_eval_train, new_scanrefer_eval_val, all_scene_list
+
 
 class ReferenceDataset(Dataset):
     def __init__(self):
@@ -299,31 +320,11 @@ class ReferenceDataset(Dataset):
                 weights = {k: v for k, v in enumerate(weights)}
                 json.dump(weights, f, indent=4)
 
-    # instance_num instance的数量（int）
-    # instance_pointnum：列表，存储了属于每个instance的点的数量
-    # instance_cls:列表，存储了这个object属于的semantic label
-    # pt_offset_label:Nx3数组，存储了每个点与该点所属object中心的偏移量
-    def getInstanceInfo(self, xyz, instance_label, semantic_label):
-        pt_mean = np.ones((xyz.shape[0], 3), dtype=np.float32) * -100.0
-        instance_pointnum = []
-        instance_cls = []
-        # max(instance_num, 0) to support instance_label with no valid instance_id
-        instance_num = max(int(instance_label.max()) + 1, 0)
-        for i_ in range(instance_num):
-            inst_idx_i = np.where(instance_label == i_)
-            xyz_i = xyz[inst_idx_i]  # 对应instance_id为i的所有点坐标
-            pt_mean[inst_idx_i] = xyz_i.mean(0)  # 这个instance的所有点的mean
-            instance_pointnum.append(inst_idx_i[0].size)
-            cls_idx = inst_idx_i[0][0]
-            instance_cls.append(semantic_label[cls_idx])
-        pt_offset_label = pt_mean - xyz
-        return instance_num, instance_pointnum, instance_cls, pt_offset_label
-
     def _load_data(self, dataset_name):
         print("loading data...")
         # load language features
         self.glove = pickle.load(open(GLOVE_PICKLE, "rb"))
-        self._build_vocabulary(dataset_name) #存储了word2index和index2word
+        self._build_vocabulary(dataset_name)  # 存储了word2index和index2word
         self.num_vocabs = len(self.vocabulary["word2idx"].keys())  # 共有多少种words
         self.lang, self.lang_ids = self._tranform_des()  # 表示caption的两个字典，详细见上def备注
         self._build_frequency(dataset_name)
@@ -407,8 +408,7 @@ class ScannetReferenceDataset(ReferenceDataset):
         self.use_multiview = use_multiview
         self.augment = augment
         self.scan2cad_rotation = scan2cad_rotation
-        self.voxel_cfg=voxel_cfg
-
+        self.voxel_cfg = voxel_cfg
 
         # load data
         self._load_data(name)
@@ -440,6 +440,7 @@ class ScannetReferenceDataset(ReferenceDataset):
             return np.hstack([i(x_)[:, None] for i in interp])
 
         return x + g(x) * mag
+
     def dataAugment(self, xyz, jitter=False, flip=False, rot=False, scale=False, prob=1.0):
         m = np.eye(3)
         if jitter and np.random.rand() < prob:
@@ -478,12 +479,12 @@ class ScannetReferenceDataset(ReferenceDataset):
         return xyz_offset, valid_idxs
 
     def transform_train(self, xyz, rgb, semantic_label, instance_label, aug_prob=1.0):
-        xyz_middle = self.dataAugment(xyz, True, True, True, aug_prob)
+        # xyz_middle = self.dataAugment(xyz, True, True, True, aug_prob)
+        xyz_middle = self.dataAugment(xyz, False, False, False, False, prob=0)  # TODO：debug暂时不开augment
         xyz = xyz_middle * self.voxel_cfg.scale
         if np.random.rand() < aug_prob:
             xyz = self.elastic(xyz, 6, 40.)
             xyz = self.elastic(xyz, 20, 160.)
-        # xyz_middle = xyz / self.voxel_cfg.scale
         xyz = xyz - xyz.min(0)
         max_tries = 5
         while (max_tries > 0):
@@ -498,17 +499,28 @@ class ScannetReferenceDataset(ReferenceDataset):
         xyz_middle = xyz_middle[valid_idxs]
         rgb = rgb[valid_idxs]
         semantic_label = semantic_label[valid_idxs]
-        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+        instance_label = instance_label[valid_idxs]
         return xyz, xyz_middle, rgb, semantic_label, instance_label
 
-    def getCroppedInstLabel(self, instance_label, valid_idxs):
-        instance_label = instance_label[valid_idxs]
-        j = 0
-        while (j < instance_label.max()):
-            if (len(np.where(instance_label == j)[0]) == 0):
-                instance_label[instance_label == instance_label.max()] = j
-            j += 1
-        return instance_label
+    # instance_num instance的数量（int）
+    # instance_pointnum：列表，存储了属于每个instance的点的数量
+    # instance_cls:列表，存储了这个object属于的semantic label
+    # pt_offset_label:Nx3数组，存储了每个点与该点所属object中心的偏移量
+    def getInstanceInfo(self, xyz, instance_label, semantic_label):
+        pt_mean = np.ones((xyz.shape[0], 3), dtype=np.float32) * -100.0
+        instance_pointnum = []
+        instance_cls = []
+        # max(instance_num, 0) to support instance_label with no valid instance_id
+        instance_num = max(int(instance_label.max()) + 1, 0)
+        for i_ in range(instance_num):
+            inst_idx_i = np.where(instance_label == i_)
+            xyz_i = xyz[inst_idx_i]  # 对应instance_id为i的所有点坐标
+            pt_mean[inst_idx_i] = xyz_i.mean(0)  # 这个instance的所有点的mean
+            instance_pointnum.append(inst_idx_i[0].size)
+            cls_idx = inst_idx_i[0][0]
+            instance_cls.append(semantic_label[cls_idx])
+        pt_offset_label = pt_mean - xyz
+        return instance_num, instance_pointnum, instance_cls, pt_offset_label
 
     def __getitem__(self, idx):
         start = time.time()
@@ -523,141 +535,87 @@ class ScannetReferenceDataset(ReferenceDataset):
         lang_len = lang_len if lang_len <= CONF.TRAIN.MAX_DES_LEN + 2 else CONF.TRAIN.MAX_DES_LEN + 2
 
         # get pc 获取前处理的点云数据
-        mesh_vertices = self.scene_data[scene_id]["mesh_vertices"]
-        instance_labels = self.scene_data[scene_id]["instance_labels"]
-        semantic_labels = self.scene_data[scene_id]["semantic_labels"]
-        instance_bboxes = self.scene_data[scene_id]["instance_bboxes"]
+        mesh_vertices = self.scene_data[scene_id]["mesh_vertices"]  # nparray float32
+        instance_labels = self.scene_data[scene_id]["instance_labels"].astype(np.int64)  # nparray int64
+        semantic_labels = self.scene_data[scene_id]["semantic_labels"].astype(np.int64)  # nparray int64
+        instance_bboxes = self.scene_data[scene_id]["instance_bboxes"]  # nparray float64
 
-        # Map relevant classes to {0,1,...,19}, and ignored classes to -100
-        remapper = np.ones(150) * (-100)
-        for i, x in enumerate([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 24, 28, 33, 34, 36, 39]):
-            remapper[x] = i
-        semantic_labels = remapper[semantic_labels]
-
-        # 从nyuid对应到训练时的class（0-17）
-        semantic_labels_cls = np.zeros(len(semantic_labels))
+        # 从nyu40id（1-40,0表示未分类）映射到语义分割时的class（0-17），wall, floor, ceiling和未分配点变为-100
+        semantic_labels_nyu40id = np.copy(semantic_labels)  # 保存原始的nyu40id
         for i in range(len(semantic_labels)):
-            if semantic_labels[i] in DC.nyu40id2class:
-                semantic_labels_cls[i] = DC.nyu40id2class[semantic_labels[i]]
-            else:
-                semantic_labels_cls[i] = 18
+            semantic_labels[i] = semantic_map[semantic_labels[i]]
+
+        # map instance label
+        instance_labels = instance_labels - 1
+        instance_labels[instance_labels == -1] = -100
 
         point_cloud = mesh_vertices[:, 0:6]
+        # 对坐标数据预处理,让其中心为(0,0,0),目的是为了后面的transform的scale放大操作
         # 获取color数据, 对color正则化，rgb范围为[-1,1]
+        point_cloud[:, 0:3] = np.ascontiguousarray(point_cloud[:, 0:3] - point_cloud[:, 0:3].mean(0))
         point_cloud[:, 3:6] = (point_cloud[:, 3:6] - MEAN_COLOR_RGB) / 256.0
         pcl_color = point_cloud[:, 3:6]
-        # 对坐标数据预处理,让其中心为(0,0,0)
-        point_cloud[:,0:3]=np.ascontiguousarray(point_cloud[:, 0:3] - point_cloud[:, 0:3].mean(0))
 
         # 随机选取num_points的点，这里是选取40000个点
         point_cloud, choices = random_sampling(point_cloud, self.num_points, return_choices=True)
         instance_labels = instance_labels[choices]
         semantic_labels = semantic_labels[choices]
-        semantic_labels_cls = semantic_labels_cls[choices]
+        semantic_labels_nyu40id = semantic_labels_nyu40id[choices]
         pcl_color = pcl_color[choices]
 
+        # --------------------------- FEAT used for SOFTGROUP -----------------------------
+        # 对数据做augmentation，xyz_middle为augment之后坐标，xyz为平移+scale之后的坐标（用于voxelization)
+        data = self.transform_train(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels, 1)
+        xyz, xyz_middle, rgb, semantic_labels, instance_labels = data
+        point_cloud = np.concatenate((xyz_middle, rgb), axis=1)
+
+        # 得到场景内instance总数，每个instance中点的数量，instance所属label，点偏移量
+        info = self.getInstanceInfo(xyz_middle, instance_labels, semantic_labels)
+        inst_num, inst_pointnum, inst_cls, pt_offset_label = info
+
+        # 规范格式保证可以batch起来
 
         # ------------------------------- LABELS ------------------------------
-        target_bboxes = np.zeros((MAX_NUM_OBJ, 6))
-        target_bboxes_mask = np.zeros((MAX_NUM_OBJ))
-        angle_classes = np.zeros((MAX_NUM_OBJ,))
-        angle_residuals = np.zeros((MAX_NUM_OBJ,))
+        target_bboxes = np.zeros((MAX_NUM_OBJ, 6))  # 场景内所有bbox的坐标+尺寸
+        target_bboxes_mask = np.zeros((MAX_NUM_OBJ))  # 场景内的所有bbox的mask
         size_classes = np.zeros((MAX_NUM_OBJ,))
         size_residuals = np.zeros((MAX_NUM_OBJ, 3))
+        num_bbox = 0  # 场景内bbox数量
 
         ref_box_label = np.zeros(MAX_NUM_OBJ)  # bbox label for reference target
         ref_center_label = np.zeros(3)  # bbox center for reference target
-        ref_heading_class_label = 0
-        ref_heading_residual_label = 0
         ref_size_class_label = 0
         ref_size_residual_label = np.zeros(3)  # bbox size residual for reference target
         ref_box_corner_label = np.zeros((8, 3))
-
-        point_votes = np.zeros([self.num_points, 3])
-        point_votes_mask = np.zeros(self.num_points)
 
         num_bbox = instance_bboxes.shape[0] if instance_bboxes.shape[0] < MAX_NUM_OBJ else MAX_NUM_OBJ
         target_bboxes_mask[0:num_bbox] = 1
         target_bboxes[0:num_bbox, :] = instance_bboxes[:MAX_NUM_OBJ, 0:6]
 
-        # ------------------------------- DATA AUGMENTATION ------------------------------
-        # augmentation，随机对所有点和
-        if self.augment:
-            if np.random.random() > 0.5:
-                # Flipping along the YZ plane
-                point_cloud[:, 0] = -1 * point_cloud[:, 0]
-                target_bboxes[:, 0] = -1 * target_bboxes[:, 0]
-
-            if np.random.random() > 0.5:
-                # Flipping along the XZ plane
-                point_cloud[:, 1] = -1 * point_cloud[:, 1]
-                target_bboxes[:, 1] = -1 * target_bboxes[:, 1]
-
-                # Rotation along X-axis
-            rot_angle = (np.random.random() * np.pi / 18) - np.pi / 36  # -5 ~ +5 degree
-            rot_mat = rotx(rot_angle)
-            point_cloud[:, 0:3] = np.dot(point_cloud[:, 0:3], np.transpose(rot_mat))
-            target_bboxes = rotate_aligned_boxes_along_axis(target_bboxes, rot_mat, "x")
-
-            # Rotation along Y-axis
-            rot_angle = (np.random.random() * np.pi / 18) - np.pi / 36  # -5 ~ +5 degree
-            rot_mat = roty(rot_angle)
-            point_cloud[:, 0:3] = np.dot(point_cloud[:, 0:3], np.transpose(rot_mat))
-            target_bboxes = rotate_aligned_boxes_along_axis(target_bboxes, rot_mat, "y")
-
-            # Rotation along up-axis/Z-axis
-            rot_angle = (np.random.random() * np.pi / 18) - np.pi / 36  # -5 ~ +5 degree
-            rot_mat = rotz(rot_angle)
-            point_cloud[:, 0:3] = np.dot(point_cloud[:, 0:3], np.transpose(rot_mat))
-            target_bboxes = rotate_aligned_boxes_along_axis(target_bboxes, rot_mat, "z")
-
-            # Translation
-            point_cloud, target_bboxes = self._translate(point_cloud, target_bboxes)
-
-        # compute votes *AFTER* augmentation
-        # generate votes
-        # Note: since there's no map between bbox instance labels and
-        # pc instance_labels (it had been filtered 
-        # in the data preparation step) we'll compute the instance bbox
-        # from the points sharing the same instance label. 
-        for i_instance in np.unique(instance_labels):
-            # find all points belong to that instance
-            ind = np.where(instance_labels == i_instance)[0]
-            # find the semantic label            
-            if semantic_labels[ind[0]] in DC.nyu40ids:
-                x = point_cloud[ind, :3]
-                center = 0.5 * (x.min(0) + x.max(0))
-                point_votes[ind, :] = center - x
-                point_votes_mask[ind] = 1.0
-        point_votes = np.tile(point_votes, (1, 3))  # make 3 votes identical
-
-        ## 重要！！！在这里完成了label的对齐，草了
-        class_ind = [DC.nyu40id2class[int(x)] for x in instance_bboxes[:num_bbox, -2]]
-
         # NOTE: set size class as semantic class. Consider use size2class.
+        # 将instance_bbox的nyu40id映射到semantic class（0-17）
+        class_ind = np.asarray([semantic_map[int(x)] for x in instance_bboxes[:num_bbox, -2]])
         size_classes[0:num_bbox] = class_ind
-        size_residuals[0:num_bbox, :] = target_bboxes[0:num_bbox, 3:6] - DC.mean_size_arr[class_ind, :]
+        size_residuals[0:num_bbox, :] = target_bboxes[0:num_bbox, 3:6] - DC.mean_size_arr[class_ind-2, :]  # 和这个类平均尺寸的偏差
+        # 上面不会出错，虽然semantic_map会将wall,floor,ceiling映射到-100,但预处理中已经去除了instance_bbox中属于这3类的bbox
+        # 所以DC.mean_size_arr不会出现indexError
 
         # construct the reference target label for each bbox
         for i, gt_id in enumerate(instance_bboxes[:num_bbox, -1]):
             if gt_id == object_id:
                 ref_box_label[i] = 1
                 ref_center_label = target_bboxes[i, 0:3]
-                ref_heading_class_label = angle_classes[i]
-                ref_heading_residual_label = angle_residuals[i]
                 ref_size_class_label = size_classes[i]
                 ref_size_residual_label = size_residuals[i]
 
                 # construct ground truth box corner coordinates
-                ref_obb = DC.param2obb(ref_center_label, ref_heading_class_label, ref_heading_residual_label,
-                                       ref_size_class_label, ref_size_residual_label)
-                ref_box_corner_label = get_3d_box(ref_obb[3:6], ref_obb[6], ref_obb[0:3])
+                ref_obb = DC.param2obb(ref_center_label, ref_size_class_label, ref_size_residual_label)
+                ref_box_corner_label = get_3d_box(ref_obb[3:6], 0, ref_obb[0:3])
 
         # construct all GT bbox corners
-        all_obb = DC.param2obb_batch(target_bboxes[:num_bbox, 0:3], angle_classes[:num_bbox].astype(np.int64),
-                                     angle_residuals[:num_bbox],
-                                     size_classes[:num_bbox].astype(np.int64), size_residuals[:num_bbox])
-        all_box_corner_label = get_3d_box_batch(all_obb[:, 3:6], all_obb[:, 6], all_obb[:, 0:3])
+        all_obb = DC.param2obb_batch(target_bboxes[:num_bbox, 0:3], size_classes[:num_bbox].astype(np.int64),
+                                     size_residuals[:num_bbox])
+        all_box_corner_label = get_3d_box_batch(all_obb[:, 3:6], np.zeros(num_bbox), all_obb[:, 0:3])
 
         # store
         gt_box_corner_label = np.zeros((MAX_NUM_OBJ, 8, 3))
@@ -671,32 +629,25 @@ class ScannetReferenceDataset(ReferenceDataset):
         target_bboxes_semcls = np.zeros((MAX_NUM_OBJ))
         target_object_ids = np.zeros((MAX_NUM_OBJ,))  # object ids of all objects
         try:
-            target_bboxes_semcls[0:num_bbox] = [DC.nyu40id2class[int(x)] for x in instance_bboxes[:, -2][0:num_bbox]]
+            target_bboxes_semcls[0:num_bbox] = [semantic_map[int(x)] for x in instance_bboxes[:, -2][0:num_bbox]]
             target_object_ids[0:num_bbox] = instance_bboxes[:, -1][0:num_bbox]
         except KeyError:
             pass
 
         object_cat = self.raw2label[object_name] if object_name in self.raw2label else 17
 
-        # --------------------------- FEAT may used for SOFTGROUP -----------------------------
-        data = self.transform_train(point_cloud[:,0:3],point_cloud[:,3:6],semantic_labels,instance_labels,1)
-        xyz, xyz_middle, rgb, semantic_labels,instance_labels = data
-
-        info = self.getInstanceInfo(point_cloud[:, 0:3], instance_labels, semantic_labels)
-        inst_num, inst_pointnum, inst_cls, pt_offset_label = info
-
         data_dict = {}
         # dataset相关
         # ----------------------------------------------------------------------
         data_dict["dataset_idx"] = np.array(idx).astype(np.int64)  # 表示这是dataset中第几个sample
 
-        # softgroup相关,同名参数，可能有重复之后再改
+        # softgroup相关参数
         # ----------------------------------------------------------------------
         data_dict["scan_id"] = scene_id
-        data_dict["coord"] = torch.from_numpy(xyz).long()  # 点坐标信息
-        data_dict["coord_float"] = torch.from_numpy(xyz_middle)  #
+        data_dict["coord"] = torch.from_numpy(xyz).long()  # scale过后的点坐标信息
+        data_dict["coord_float"] = torch.from_numpy(xyz_middle)  # scale之前的原始点坐标信息
         data_dict["feat"] = torch.from_numpy(rgb).float()  # 点特征信息，这里是rgb color
-        data_dict["semantic_label"] = torch.from_numpy(np.array(semantic_labels).astype(np.int64))
+        data_dict["semantic_label"] = torch.from_numpy(semantic_labels)
         data_dict["instance_label"] = torch.from_numpy(np.array(instance_labels).astype(np.int64))
         data_dict["inst_num"] = np.array(inst_num).astype(np.int64)
         data_dict["inst_pointnum"] = np.array(inst_pointnum).astype(np.int64)
@@ -707,18 +658,17 @@ class ScannetReferenceDataset(ReferenceDataset):
         # ----------------------------------------------------------------------
         data_dict["point_clouds"] = point_cloud.astype(np.float32)  # point cloud data including features
         data_dict["pcl_color"] = pcl_color
-        data_dict["semantic_label_nyu40id"] = np.array(semantic_labels).astype(np.int64)
-        data_dict["semantic_label_cls"] = np.array(semantic_labels_cls).astype(np.int64)
-        # data_dict["instance_label"] = np.array(instance_labels).astype(np.int64)
-        data_dict["object_id"] = np.array(int(object_id)).astype(np.int64)  # 该物体在场景中的id
+        data_dict["semantic_label_nyu40id"] = np.array(semantic_labels_nyu40id).astype(np.int64)
+        data_dict["object_id"] = torch.from_numpy(np.array(int(object_id)).astype(np.int64))  # 该物体在场景中的id
         data_dict["object_cat"] = np.array(object_cat).astype(np.int64)  # 该物体对应的category（0-17）
         data_dict["ann_id"] = np.array(int(ann_id)).astype(np.int64)  # 该描述的id
 
         # language description相关
         # ----------------------------------------------------------------------
-        data_dict["lang_feat"] = lang_feat.astype(np.float32)  # language feature vectors
-        data_dict["lang_len"] = np.array(lang_len).astype(np.int64)  # length of each description
-        data_dict["lang_ids"] = np.array(self.lang_ids[scene_id][str(object_id)][ann_id]).astype(np.int64)  # 对应单词idx的列表
+        data_dict["lang_feat"] = torch.from_numpy(lang_feat.astype(np.float32))  # language feature vectors
+        data_dict["lang_len"] = torch.from_numpy(np.array(lang_len).astype(np.int64))  # length of each description
+        data_dict["lang_ids"] = torch.from_numpy(
+            np.array(self.lang_ids[scene_id][str(object_id)][ann_id]).astype(np.int64))  # 对应单词idx的列表
 
         # GT bounding box相关，即该train sample对应的场景scene中的所有bbox
         # ----------------------------------------------------------------------
@@ -753,44 +703,12 @@ class ScannetReferenceDataset(ReferenceDataset):
         data_dict["sem_cls_label"] = target_bboxes_semcls.astype(np.int64)  # (MAX_NUM_OBJ,)，object对应的semantic class
         data_dict["scene_object_ids"] = target_object_ids.astype(np.int64)  # (MAX_NUM_OBJ,)，object对应的object_id
 
-        # point_votes相关（还不是很懂）
-        data_dict["vote_label"] = point_votes.astype(np.float32)
-        data_dict["vote_label_mask"] = point_votes_mask.astype(np.int64)
-
         # unique_multiple，0表示该物体类型在场景中只有一个，1则表示该场景中有多个该种object
         data_dict["unique_multiple"] = np.array(self.unique_multiple_lookup[scene_id][str(object_id)][ann_id]).astype(
             np.int64)
 
         # 加载时间相关
         data_dict["load_time"] = time.time() - start
-
-        '''
-        # 旋转相关的暂时用不到
-        
-        # object rotations
-        scene_object_rotations = np.zeros((MAX_NUM_OBJ, 3, 3))
-        scene_object_rotation_masks = np.zeros((MAX_NUM_OBJ,))  # NOTE this is not object mask!!!
-        # if scene is not in scan2cad annotations, skip
-        # if the instance is not in scan2cad annotations, skip
-        if self.scan2cad_rotation and scene_id in self.scan2cad_rotation:
-            for i, instance_id in enumerate(instance_bboxes[:num_bbox, -1].astype(int)):
-                try:
-                    rotation = np.array(self.scan2cad_rotation[scene_id][str(instance_id)])
-
-                    scene_object_rotations[i] = rotation
-                    scene_object_rotation_masks[i] = 1
-                except KeyError:
-                    pass
-        data_dict["scene_object_rotations"] = scene_object_rotations.astype(np.float32)  # (MAX_NUM_OBJ, 3, 3)
-        data_dict["scene_object_rotation_masks"] = scene_object_rotation_masks.astype(np.int64)  # (MAX_NUM_OBJ)
-
-        # 场景旋转相关（ScanNet用不到）
-        data_dict["heading_class_label"] = angle_classes.astype(
-            np.int64)  # (MAX_NUM_OBJ,) with int values in 0,...,NUM_HEADING_BIN-1
-        data_dict["heading_residual_label"] = angle_residuals.astype(np.float32)  # (MAX_NUM_OBJ,)
-        data_dict["ref_heading_class_label"] = np.array(int(ref_heading_class_label)).astype(np.int64)
-        data_dict["ref_heading_residual_label"] = np.array(int(ref_heading_residual_label)).astype(np.int64)
-        '''
 
         return data_dict
 
@@ -801,7 +719,6 @@ class ScannetReferenceDataset(ReferenceDataset):
         feats = []
         semantic_labels = []
         instance_labels = []
-
         instance_pointnum = []  # (total_nInst), int
         instance_cls = []  # (total_nInst), long
         pt_offset_labels = []
@@ -851,8 +768,12 @@ class ScannetReferenceDataset(ReferenceDataset):
         instance_cls = torch.tensor(instance_cls, dtype=torch.long)  # long (total_nInst)
         pt_offset_labels = torch.cat(pt_offset_labels).float()
 
-        spatial_shape = np.clip(
-            coords.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
+        object_id = torch.cat([batch[i]['object_id'].unsqueeze(0) for i in range(len(batch))], 0)
+        lang_feat = torch.cat([batch[i]['lang_feat'].unsqueeze(0) for i in range(len(batch))], 0)
+        lang_len = torch.cat([batch[i]['lang_len'].unsqueeze(0) for i in range(len(batch))], 0)
+        lang_ids = torch.cat([batch[i]['lang_ids'].unsqueeze(0) for i in range(len(batch))], 0)
+
+        spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
 
         voxel_coords, v2p_map, p2v_map = voxelization_idx(coords, batch_id)
 
@@ -874,6 +795,11 @@ class ScannetReferenceDataset(ReferenceDataset):
             'spatial_shape': spatial_shape,
             'batch_size': batch_id,
 
+            'lang_feat': lang_feat,
+            'lang_len': lang_len,
+            'lang_ids': lang_ids,
+            'object_id': object_id,
+            'test': "ok"
             # captioning need TODO:还没有加，根据scan2cap看看batch中还需要什么信息
         }
 
