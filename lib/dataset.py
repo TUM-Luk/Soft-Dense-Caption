@@ -29,7 +29,7 @@ from data.scannet.model_util_scannet import rotate_aligned_boxes, ScannetDataset
 
 from copy import deepcopy
 
-# map nyu40id label (1-40) to class label (0-17), wall, floor, ceiling (-100) are NOT considered in cluster grouping
+# map nyu40id label (1-40) to class label (0-19), wall(0), floor(1), ceiling (-100) are NOT considered in cluster grouping
 semantic_map = {
     22: -100, 0: -100,  # ceiling(22), unannotated(0)
     1: 0,  # wall
@@ -385,14 +385,8 @@ class ScannetReferenceDataset(ReferenceDataset):
 
     def __init__(self, scanrefer, scanrefer_all_scene,
                  split="train",
-                 name="ScanRefer",
                  num_points=40000,
-                 use_height=False,
-                 use_color=True,
-                 use_normal=False,
-                 use_multiview=False,
                  augment=False,
-                 scan2cad_rotation=None,
                  voxel_cfg=CONF.voxel_cfg):
 
         # NOTE only feed the scan2cad_rotation when on the training mode and train split
@@ -400,19 +394,12 @@ class ScannetReferenceDataset(ReferenceDataset):
         self.scanrefer = scanrefer
         self.scanrefer_all_scene = scanrefer_all_scene  # all scene_ids in scanrefer 所有scene_id
         self.split = split
-        self.name = name
         self.num_points = num_points
-        self.use_color = use_color
-        self.use_height = use_height
-        self.use_normal = use_normal
-        self.use_multiview = use_multiview
         self.augment = augment
-        self.scan2cad_rotation = scan2cad_rotation
         self.voxel_cfg = voxel_cfg
 
         # load data
-        self._load_data(name)
-        self.multiview_data = {}
+        self._load_data('Scanrefer')
 
     def __len__(self):
         return len(self.scanrefer)
@@ -479,8 +466,10 @@ class ScannetReferenceDataset(ReferenceDataset):
         return xyz_offset, valid_idxs
 
     def transform_train(self, xyz, rgb, semantic_label, instance_label, aug_prob=1.0):
-        # xyz_middle = self.dataAugment(xyz, True, True, True, aug_prob)
-        xyz_middle = self.dataAugment(xyz, False, False, False, False, prob=0)  # TODO：debug暂时不开augment
+        if self.augment == True:
+            xyz_middle = self.dataAugment(xyz, True, True, True, True, aug_prob)
+        else:
+            xyz_middle = xyz
         xyz = xyz_middle * self.voxel_cfg.scale
         if np.random.rand() < aug_prob:
             xyz = self.elastic(xyz, 6, 40.)
@@ -499,6 +488,17 @@ class ScannetReferenceDataset(ReferenceDataset):
         xyz_middle = xyz_middle[valid_idxs]
         rgb = rgb[valid_idxs]
         semantic_label = semantic_label[valid_idxs]
+        instance_label = instance_label[valid_idxs]
+        return xyz, xyz_middle, rgb, semantic_label, instance_label
+
+    def transform_test(self, xyz, rgb, semantic_label, instance_label):
+        if self.augment == True:
+            xyz_middle = self.dataAugment(xyz, False, False, False, False)
+        else:
+            xyz_middle = xyz
+        xyz = xyz_middle * self.voxel_cfg.scale
+        xyz -= xyz.min(0)
+        valid_idxs = np.ones(xyz.shape[0], dtype=bool)
         instance_label = instance_label[valid_idxs]
         return xyz, xyz_middle, rgb, semantic_label, instance_label
 
@@ -540,7 +540,7 @@ class ScannetReferenceDataset(ReferenceDataset):
         semantic_labels = self.scene_data[scene_id]["semantic_labels"].astype(np.int64)  # nparray int64
         instance_bboxes = self.scene_data[scene_id]["instance_bboxes"]  # nparray float64
 
-        # 从nyu40id（1-40,0表示未分类）映射到语义分割时的class（0-17），wall, floor, ceiling和未分配点变为-100
+        # 从nyu40id（1-40,0表示未分类）映射到语义分割时的class（0-19）, ceiling和未分配点变为-100
         semantic_labels_nyu40id = np.copy(semantic_labels)  # 保存原始的nyu40id
         for i in range(len(semantic_labels)):
             semantic_labels[i] = semantic_map[semantic_labels[i]]
@@ -556,24 +556,26 @@ class ScannetReferenceDataset(ReferenceDataset):
         point_cloud[:, 3:6] = (point_cloud[:, 3:6] - MEAN_COLOR_RGB) / 256.0
         pcl_color = point_cloud[:, 3:6]
 
-        # 随机选取num_points的点，这里是选取40000个点
-        point_cloud, choices = random_sampling(point_cloud, self.num_points, return_choices=True)
-        instance_labels = instance_labels[choices]
-        semantic_labels = semantic_labels[choices]
-        semantic_labels_nyu40id = semantic_labels_nyu40id[choices]
-        pcl_color = pcl_color[choices]
+        if self.split == 'train':
+            # 随机选取num_points的点，这里是选取40000个点
+            point_cloud, choices = random_sampling(point_cloud, self.num_points, return_choices=True)
+            instance_labels = instance_labels[choices]
+            semantic_labels = semantic_labels[choices]
+            semantic_labels_nyu40id = semantic_labels_nyu40id[choices]
+            pcl_color = pcl_color[choices]
 
         # --------------------------- FEAT used for SOFTGROUP -----------------------------
-        # 对数据做augmentation，xyz_middle为augment之后坐标，xyz为平移+scale之后的坐标（用于voxelization)
-        data = self.transform_train(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels, 1)
+        # 对数据做augmentation，xyz_middle为augment之后坐标，xyz为平移+放大xyz_middle之后的坐标（用于voxelization)
+        if self.augment:
+            data = self.transform_train(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels, 1)
+        else:
+            data = self.transform_test(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels)
         xyz, xyz_middle, rgb, semantic_labels, instance_labels = data
         point_cloud = np.concatenate((xyz_middle, rgb), axis=1)
 
         # 得到场景内instance总数，每个instance中点的数量，instance所属label，点偏移量
         info = self.getInstanceInfo(xyz_middle, instance_labels, semantic_labels)
         inst_num, inst_pointnum, inst_cls, pt_offset_label = info
-
-        # 规范格式保证可以batch起来
 
         # ------------------------------- LABELS ------------------------------
         target_bboxes = np.zeros((MAX_NUM_OBJ, 6))  # 场景内所有bbox的坐标+尺寸
@@ -587,16 +589,18 @@ class ScannetReferenceDataset(ReferenceDataset):
         ref_size_class_label = 0
         ref_size_residual_label = np.zeros(3)  # bbox size residual for reference target
         ref_box_corner_label = np.zeros((8, 3))
+        ref_size_label = np.zeros(3)
 
         num_bbox = instance_bboxes.shape[0] if instance_bboxes.shape[0] < MAX_NUM_OBJ else MAX_NUM_OBJ
         target_bboxes_mask[0:num_bbox] = 1
         target_bboxes[0:num_bbox, :] = instance_bboxes[:MAX_NUM_OBJ, 0:6]
 
         # NOTE: set size class as semantic class. Consider use size2class.
-        # 将instance_bbox的nyu40id映射到semantic class（0-17）
+        # 将instance_bbox的nyu40id映射到semantic class（0-19）
         class_ind = np.asarray([semantic_map[int(x)] for x in instance_bboxes[:num_bbox, -2]])
         size_classes[0:num_bbox] = class_ind
-        size_residuals[0:num_bbox, :] = target_bboxes[0:num_bbox, 3:6] - DC.mean_size_arr[class_ind-2, :]  # 和这个类平均尺寸的偏差
+        size_residuals[0:num_bbox, :] = target_bboxes[0:num_bbox, 3:6] - DC.mean_size_arr[class_ind - 2,
+                                                                         :]  # 和这个类平均尺寸的偏差
         # 上面不会出错，虽然semantic_map会将wall,floor,ceiling映射到-100,但预处理中已经去除了instance_bbox中属于这3类的bbox
         # 所以DC.mean_size_arr不会出现indexError
 
@@ -605,6 +609,7 @@ class ScannetReferenceDataset(ReferenceDataset):
             if gt_id == object_id:
                 ref_box_label[i] = 1
                 ref_center_label = target_bboxes[i, 0:3]
+                ref_size_label = target_bboxes[i, 3:6]
                 ref_size_class_label = size_classes[i]
                 ref_size_residual_label = size_residuals[i]
 
@@ -691,12 +696,13 @@ class ScannetReferenceDataset(ReferenceDataset):
         # ref bounding box相关，即该train sample中对应的物体的bbox
         # ----------------------------------------------------------------------
         data_dict["ref_box_label"] = ref_box_label.astype(np.int64)  # 0/1 reference labels for each object bbox，1表示当前物体
-        data_dict["ref_center_label"] = ref_center_label.astype(np.float32)  # 该ref bbox的中心点坐标
+        data_dict["ref_center_label"] = torch.from_numpy(ref_center_label.astype(np.float32))  # 该ref bbox的中心点坐标
         data_dict["ref_size_class_label"] = np.array(int(ref_size_class_label)).astype(
             np.int64)  # 该ref bbox对应的class（0-17）
-        data_dict["ref_size_residual_label"] = ref_size_residual_label.astype(np.float32)  # 该ref bbox的尺寸数据
+        data_dict["ref_size_residual_label"] = ref_size_residual_label.astype(np.float32)  # 该ref bbox的尺寸误差数据
         data_dict["ref_box_corner_label"] = ref_box_corner_label.astype(
             np.float64)  # target box corners NOTE type must be double，即ref bbox的8个corner点坐标
+        data_dict['ref_size_label'] = torch.from_numpy(ref_size_label.astype(np.float32))  # 该ref bbox的尺寸数据
 
         # target相关
         # ----------------------------------------------------------------------
@@ -772,6 +778,8 @@ class ScannetReferenceDataset(ReferenceDataset):
         lang_feat = torch.cat([batch[i]['lang_feat'].unsqueeze(0) for i in range(len(batch))], 0)
         lang_len = torch.cat([batch[i]['lang_len'].unsqueeze(0) for i in range(len(batch))], 0)
         lang_ids = torch.cat([batch[i]['lang_ids'].unsqueeze(0) for i in range(len(batch))], 0)
+        ref_size_label = torch.cat([batch[i]['ref_size_label'].unsqueeze(0) for i in range(len(batch))], 0)
+        ref_center_label = torch.cat([batch[i]['ref_center_label'].unsqueeze(0) for i in range(len(batch))], 0)
 
         spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
 
@@ -795,12 +803,17 @@ class ScannetReferenceDataset(ReferenceDataset):
             'spatial_shape': spatial_shape,
             'batch_size': batch_id,
 
+            # proposal module need
+            'object_id': object_id,
+            'ref_size_label': ref_size_label,
+            'ref_center_label': ref_center_label,
+
+            # caption module need
             'lang_feat': lang_feat,
             'lang_len': lang_len,
             'lang_ids': lang_ids,
-            'object_id': object_id,
-            'test': "ok"
-            # captioning need TODO:还没有加，根据scan2cap看看batch中还需要什么信息
+
+
         }
 
 

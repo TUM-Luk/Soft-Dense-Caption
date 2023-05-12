@@ -68,11 +68,46 @@ class CaptionModule(nn.Module):
 
         return hidden, hidden
 
+    def compute_loss(self,data_dict):
+        pred_caps = data_dict['lang_cap'] # (B, num_words - 1, num_vocabs)
+        num_words = data_dict['lang_len'].max()
+        target_caps = data_dict['lang_ids'][:,1:num_words] # (B, num_words - 1)
+
+        _, _, num_vocabs = pred_caps.shape
+
+        # caption loss
+        criterion = nn.CrossEntropyLoss(ignore_index=0, reduction="none")
+        cap_loss = criterion(pred_caps.reshape(-1, num_vocabs), target_caps.reshape(-1))
+
+        # mask out bad boxes
+        good_bbox_masks = data_dict["good_clu_masks"].unsqueeze(1).repeat(1, num_words - 1)  # (B, num_words - 1)
+        good_bbox_masks = good_bbox_masks.reshape(-1)  # (B * num_words - 1)
+        cap_loss = torch.sum(cap_loss * good_bbox_masks) / (torch.sum(good_bbox_masks) + 1e-6)
+
+        num_good_bbox = data_dict["good_clu_masks"].sum()
+        if num_good_bbox > 0:  # only apply loss on the good boxes
+            pred_caps = pred_caps[data_dict["good_clu_masks"]]  # num_good_bbox
+            target_caps = target_caps[data_dict["good_clu_masks"]]  # num_good_bbox
+
+            # caption acc
+            pred_caps = pred_caps.reshape(-1, num_vocabs).argmax(-1)  # num_good_bbox * (num_words - 1)
+            target_caps = target_caps.reshape(-1)  # num_good_bbox * (num_words - 1)
+            masks = target_caps != 0
+            masked_pred_caps = pred_caps[masks]
+            masked_target_caps = target_caps[masks]
+            cap_acc = (masked_pred_caps == masked_target_caps).sum().float() / masks.sum().float()
+        else:  # zero placeholder if there is no good box
+            cap_acc = torch.zeros(1)[0].cuda()
+
+        return cap_loss, cap_acc
+
     def forward(self, data_dict, use_tf=True, is_eval=False, max_len=CONF.TRAIN.MAX_DES_LEN):
         if not is_eval:
             data_dict = self.forward_sample_batch(data_dict, max_len)
         else:
             data_dict = self.forward_scene_batch(data_dict, use_tf, max_len)
+
+        data_dict['cap_loss'], data_dict['cap_acc'] = self.compute_loss(data_dict)
 
         return data_dict
 
@@ -87,7 +122,6 @@ class CaptionModule(nn.Module):
         obj_feats = data_dict["select_feats"].cuda()  # batch_size, feat_size
 
         num_words = des_lens.max()
-        print(num_words)
         batch_size = des_lens.shape[0]
 
         # transform the features
@@ -201,6 +235,3 @@ class CaptionModule(nn.Module):
         data_dict["lang_cap"] = outputs
 
         return data_dict
-
-
-# test

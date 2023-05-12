@@ -14,9 +14,12 @@
 /lib/__pycache__
 /utils/__pycache__
 /model/__pycache__
-
+/scripts/__pycache__
+/model/__pycache__
 
 
 # Pycharm IDE
 /.idea
 
+# lightning_logs
+/scripts/lightning_logs
