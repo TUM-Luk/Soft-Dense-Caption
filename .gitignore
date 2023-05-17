@@ -23,3 +23,9 @@
 
 # lightning_logs
 /scripts/lightning_logs
+
+# visualization
+/visualization
+
+# model
+/scripts/model_checkpoint_epoch1.ckpt

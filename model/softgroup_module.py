@@ -32,6 +32,7 @@ class SoftGroup(nn.Module):
                  instance_voxel_cfg=CONF.instance_voxel_cfg,
                  train_cfg=CONF.train_cfg,
                  test_cfg=CONF.test_cfg,
+                 sem2ins_classes=[],
                  fixed_modules=[]):
         super().__init__()
         self.in_channels = in_channels
@@ -45,6 +46,7 @@ class SoftGroup(nn.Module):
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         self.fixed_modules = fixed_modules
+        self.sem2ins_classes = sem2ins_classes
 
         block = ResidualBlock
         norm_fn = functools.partial(nn.BatchNorm1d, eps=1e-4, momentum=0.1)
@@ -134,9 +136,9 @@ class SoftGroup(nn.Module):
                 if iou_score.max() > 0.2:
                     good_clu_masks[i] = 1
 
-                print(iou_score)
-                print(iou_score.argmax())
-                print("最匹配的cluster的下标为:", iou_score.argmax() + proposal_id_offset[i])
+                # print(iou_score)
+                # print(iou_score.argmax())
+                # print("最匹配的cluster的下标为:", iou_score.argmax() + proposal_id_offset[i])
 
         return select_proposal_idx, proposal_id_offset, good_clu_masks
 
@@ -147,17 +149,17 @@ class SoftGroup(nn.Module):
 
         feats = torch.cat((feats, coords_float), 1)
         voxel_feats = voxelization(feats, p2v_map)
-
         input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
         semantic_scores, pt_offsets, output_feats = self.forward_backbone(input, v2p_map)
-
+        # print(output_feats.shape)
+        # print(torch.unique(output_feats,dim=0).shape)
         proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(semantic_scores, pt_offsets,
                                                                                      batch_idxs, coords_float,
                                                                                      self.grouping_cfg)
 
         select_proposal_idx, proposal_id_offset, good_clu_masks = self.select_feat(proposals_idx, proposal_each_scene,
-                                                                                  instance_labels, object_id,
-                                                                                  batch_size)
+                                                                                   instance_labels, object_id,
+                                                                                   batch_size)
 
         # 提取每个instance proposal的feature
         # 这里的是voxelization之后的，即inst_feat是tiny unet的输入
@@ -189,6 +191,124 @@ class SoftGroup(nn.Module):
         print(good_clu_masks)
         return clus_feats_batch, select_feats, losses, good_clu_masks
 
+    @cuda_cast
+    def forward_val(self, batch_idxs, voxel_coords, p2v_map, v2p_map, coords_float, feats,
+                    semantic_labels, instance_labels, pt_offset_labels, spatial_shape,
+                    batch_size, object_id, **kwargs):
+
+        feats = torch.cat((feats, coords_float), 1)
+        voxel_feats = voxelization(feats, p2v_map)
+
+        input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
+        semantic_scores, pt_offsets, output_feats = self.forward_backbone(input, v2p_map)
+
+        proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(semantic_scores, pt_offsets,
+                                                                                     batch_idxs, coords_float,
+                                                                                     self.grouping_cfg)
+
+        proposal_id_offset = np.zeros(batch_size + 1).astype(np.int64)
+        for i in range(batch_size + 1):
+            proposal_id_offset[i] = sum(proposal_each_scene[0:i])
+
+        num_proposal = sum(proposal_each_scene)
+        clus_center = torch.zeros(num_proposal, 3).float().cuda()
+        for i in range(num_proposal):
+            coords_idx = proposals_idx[proposals_offset[i]:proposals_offset[i + 1]][1].long()
+            center = torch.mean(coords_float[coords_idx], dim=0)
+            clus_center[i] = center
+
+        # 提取每个instance proposal的feature
+        # 这里的是voxelization之后的，即inst_feat是tiny unet的输入
+        # inst_map是用来devoxelization的map
+        inst_feats, inst_map = self.clusters_voxelization(proposals_idx, proposals_offset, output_feats,
+                                                          coords_float, rand_quantize=True, **self.instance_voxel_cfg)
+
+        feats = self.tiny_unet(inst_feats)
+        feats = self.tiny_unet_outputlayer(feats)
+        feats = self.global_pool(feats)
+
+        # print(feats)
+        # 对feats维度进行重构,从(N,32)变为(B,M,32)
+        clus_feats_batch = torch.zeros([batch_size, self.train_cfg.max_proposal_num, feats.shape[1]]).cuda()
+        for i in range(batch_size):
+            clus_feats_batch[i][0:proposal_each_scene[i]] = feats[proposal_id_offset[i]:proposal_id_offset[i + 1]]
+
+        # 对centers进行重构，从(N,3)变为(B,M,3)
+        clus_center_batch = torch.zeros([batch_size, self.train_cfg.max_proposal_num, 3]).cuda()
+        for i in range(batch_size):
+            clus_center_batch[i][0:proposal_each_scene[i]] = clus_center[
+                                                             proposal_id_offset[i]:proposal_id_offset[i + 1]]
+
+        # mask用来指示该位置是否是cluster，维度为(B,M)
+        valid_clu_masks = torch.zeros(batch_size, self.train_cfg.max_proposal_num).bool().cuda()
+        for i in range(batch_size):
+            valid_clu_masks[i][0:proposal_each_scene[i]] = True
+
+        # point wise losses
+        losses = {}
+        point_wise_loss = self.point_wise_loss(semantic_scores, pt_offsets, semantic_labels,
+                                               instance_labels, pt_offset_labels)
+        losses.update(point_wise_loss)
+
+        return clus_feats_batch, clus_center_batch, valid_clu_masks, losses
+
+    @cuda_cast
+    def forward_visualization(self, batch_idxs, voxel_coords, p2v_map, v2p_map, coords_float, feats,
+                              semantic_labels, instance_labels, pt_offset_labels, spatial_shape, batch_size,
+                              scan_ids, **kwargs):
+        color_feats = feats
+
+        feats = torch.cat((feats, coords_float), 1)
+
+        voxel_feats = voxelization(feats, p2v_map)
+        input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
+
+        semantic_scores, pt_offsets, output_feats = self.forward_backbone(input, v2p_map)
+
+        semantic_preds = semantic_scores.max(1)[1]
+        ret = dict(scan_id=scan_ids[0])
+        ret.update(
+            dict(
+                semantic_labels=semantic_labels.cpu().numpy(),
+                instance_labels=instance_labels.cpu().numpy()))
+
+        point_wise_results = self.get_point_wise_results(coords_float, color_feats,
+                                                         semantic_preds, pt_offsets,
+                                                         pt_offset_labels, v2p_map, lvl_fusion=False)
+        ret.update(point_wise_results)
+
+        proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(
+            semantic_scores,
+            pt_offsets,
+            batch_idxs,
+            coords_float,
+            self.grouping_cfg)
+
+        inst_feats, inst_map = self.clusters_voxelization(proposals_idx, proposals_offset,
+                                                          output_feats, coords_float,
+                                                          **self.instance_voxel_cfg)
+
+        _, cls_scores, iou_scores, mask_scores = self.forward_instance(inst_feats, inst_map)
+
+        pred_instances = self.get_instances(
+            scan_ids[0],
+            proposals_idx,
+            semantic_scores,
+            cls_scores,
+            iou_scores,
+            mask_scores,
+            v2p_map=v2p_map,
+            lvl_fusion=False)
+
+        gt_instances = self.get_gt_instances(semantic_labels, instance_labels)
+        ret.update(dict(pred_instances=pred_instances, gt_instances=gt_instances))
+
+        feats = self.tiny_unet(inst_feats)
+        feats = self.tiny_unet_outputlayer(feats)
+        unselect_feats = self.global_pool(feats)
+        ret.update(dict(unselect_feats=unselect_feats))
+
+        return ret
     def point_wise_loss(self, semantic_scores, pt_offsets, semantic_labels, instance_labels,
                         pt_offset_labels):
         losses = {}
@@ -370,3 +490,114 @@ class SoftGroup(nn.Module):
         x_pool_expand = x_pool[indices.long()]
         x.features = torch.cat((x.features, x_pool_expand), dim=1)
         return x
+
+    def forward_instance(self, inst_feats, inst_map):
+        feats = self.tiny_unet(inst_feats)
+        feats = self.tiny_unet_outputlayer(feats)
+
+        # predict mask scores
+        mask_scores = self.mask_linear(feats.features)
+        mask_scores = mask_scores[inst_map.long()]
+        instance_batch_idxs = feats.indices[:, 0][inst_map.long()]
+
+        # predict instance cls and iou scores
+        feats = self.global_pool(feats)
+        cls_scores = self.cls_linear(feats)
+        iou_scores = self.iou_score_linear(feats)
+        return instance_batch_idxs, cls_scores, iou_scores, mask_scores
+
+    @force_fp32(apply_to=('semantic_scores', 'cls_scores', 'iou_scores', 'mask_scores'))
+    def get_instances(self,
+                      scan_id,
+                      proposals_idx,
+                      semantic_scores,
+                      cls_scores,
+                      iou_scores,
+                      mask_scores,
+                      v2p_map=None,
+                      lvl_fusion=False):
+        if proposals_idx.size(0) == 0:
+            return []
+
+        num_instances = cls_scores.size(0)
+        num_points = semantic_scores.size(0)
+        cls_scores = cls_scores.softmax(1)
+        semantic_pred = semantic_scores.max(1)[1]
+        cls_pred_list, score_pred_list, mask_pred_list = [], [], []
+        for i in range(self.instance_classes):
+            if i in self.sem2ins_classes:
+                cls_pred = cls_scores.new_tensor([i + 1], dtype=torch.long)
+                score_pred = cls_scores.new_tensor([1.], dtype=torch.float32)
+                mask_pred = (semantic_pred == i)[None, :].int()
+                if lvl_fusion:
+                    mask_pred = mask_pred[:, v2p_map.long()]
+            else:
+                cls_pred = cls_scores.new_full((num_instances,), i + 1, dtype=torch.long)
+                cur_cls_scores = cls_scores[:, i]
+                cur_iou_scores = iou_scores[:, i]
+                cur_mask_scores = mask_scores[:, i]
+                score_pred = cur_cls_scores * cur_iou_scores.clamp(0, 1)
+                mask_pred = torch.zeros((num_instances, num_points), dtype=torch.int, device='cuda')
+                mask_inds = cur_mask_scores > self.test_cfg.mask_score_thr
+                cur_proposals_idx = proposals_idx[mask_inds].long()
+                mask_pred[cur_proposals_idx[:, 0], cur_proposals_idx[:, 1]] = 1
+
+                # filter low score instance
+                inds = cur_cls_scores > self.test_cfg.cls_score_thr
+                cls_pred = cls_pred[inds]
+                score_pred = score_pred[inds]
+                mask_pred = mask_pred[inds]
+
+                if lvl_fusion:
+                    mask_pred = mask_pred[:, v2p_map.long()]
+
+                # filter too small instances
+                npoint = mask_pred.sum(1)
+                inds = npoint >= self.test_cfg.min_npoint
+                cls_pred = cls_pred[inds]
+                score_pred = score_pred[inds]
+                mask_pred = mask_pred[inds]
+            cls_pred_list.append(cls_pred.cpu())
+            score_pred_list.append(score_pred.cpu())
+            mask_pred_list.append(mask_pred.cpu())
+        cls_pred = torch.cat(cls_pred_list).numpy()
+        score_pred = torch.cat(score_pred_list).numpy()
+        mask_pred = torch.cat(mask_pred_list).numpy()
+
+        instances = []
+        for i in range(cls_pred.shape[0]):
+            pred = {}
+            pred['scan_id'] = scan_id
+            pred['label_id'] = cls_pred[i]
+            pred['conf'] = score_pred[i]
+            # rle encode mask to save memory
+            pred['pred_mask'] = rle_encode(mask_pred[i])
+            instances.append(pred)
+        return instances
+
+    def get_gt_instances(self, semantic_labels, instance_labels):
+        """Get gt instances for evaluation."""
+        # convert to evaluation format 0: ignore, 1->N: valid
+        label_shift = self.semantic_classes - self.instance_classes
+        semantic_labels = semantic_labels - label_shift + 1
+        semantic_labels[semantic_labels < 0] = 0
+        instance_labels += 1
+        ignore_inds = instance_labels < 0
+        # scannet encoding rule
+        gt_ins = semantic_labels * 1000 + instance_labels
+        gt_ins[ignore_inds] = 0
+        gt_ins = gt_ins.cpu().numpy()
+        return gt_ins
+
+    @force_fp32(apply_to=('semantic_preds', 'offset_preds'))
+    def get_point_wise_results(self, coords_float, color_feats, semantic_preds, offset_preds,
+                               offset_labels, v2p_map, lvl_fusion):
+        if lvl_fusion:
+            semantic_preds = semantic_preds[v2p_map.long()]
+            offset_preds = offset_preds[v2p_map.long()]
+        return dict(
+            coords_float=coords_float.cpu().numpy(),
+            color_feats=color_feats.cpu().numpy(),
+            semantic_preds=semantic_preds.cpu().numpy(),
+            offset_preds=offset_preds.cpu().numpy(),
+            offset_labels=offset_labels.cpu().numpy())

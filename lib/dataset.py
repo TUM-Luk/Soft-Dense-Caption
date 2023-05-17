@@ -100,11 +100,16 @@ def get_scanrefer(model=None):
         data["scene_id"] = scene_id
         new_scanrefer_eval_train.append(data)
 
+    # eval on val
     new_scanrefer_eval_val = []
     for scene_id in val_scene_list:
         data = deepcopy(SCANREFER_TRAIN[0])
         data["scene_id"] = scene_id
         new_scanrefer_eval_val.append(data)
+
+    # for data in scanrefer_eval_val:
+    #     if data["scene_id"] in val_scene_list:
+    #         new_scanrefer_eval_val.append(data)
 
     # all scanrefer scene
     all_scene_list = train_scene_list + val_scene_list
@@ -514,6 +519,10 @@ class ScannetReferenceDataset(ReferenceDataset):
         instance_num = max(int(instance_label.max()) + 1, 0)
         for i_ in range(instance_num):
             inst_idx_i = np.where(instance_label == i_)
+            if inst_idx_i[0].size == 0:  # 因为在前处理时，有些instance比如ceiling已经被删除了，所以可能会有空余的instance_label
+                instance_pointnum.append(inst_idx_i[0].size)
+                instance_cls.append(-100)
+                continue
             xyz_i = xyz[inst_idx_i]  # 对应instance_id为i的所有点坐标
             pt_mean[inst_idx_i] = xyz_i.mean(0)  # 这个instance的所有点的mean
             instance_pointnum.append(inst_idx_i[0].size)
@@ -551,10 +560,12 @@ class ScannetReferenceDataset(ReferenceDataset):
 
         point_cloud = mesh_vertices[:, 0:6]
         # 对坐标数据预处理,让其中心为(0,0,0),目的是为了后面的transform的scale放大操作
+        # 对instance_bbox也中心化
         # 获取color数据, 对color正则化，rgb范围为[-1,1]
         point_cloud[:, 0:3] = np.ascontiguousarray(point_cloud[:, 0:3] - point_cloud[:, 0:3].mean(0))
         point_cloud[:, 3:6] = (point_cloud[:, 3:6] - MEAN_COLOR_RGB) / 256.0
         pcl_color = point_cloud[:, 3:6]
+        instance_bboxes[:, 0:3] = instance_bboxes[:, 0:3] - point_cloud[:, 0:3].mean(0)
 
         if self.split == 'train':
             # 随机选取num_points的点，这里是选取40000个点
@@ -601,8 +612,8 @@ class ScannetReferenceDataset(ReferenceDataset):
         size_classes[0:num_bbox] = class_ind
         size_residuals[0:num_bbox, :] = target_bboxes[0:num_bbox, 3:6] - DC.mean_size_arr[class_ind - 2,
                                                                          :]  # 和这个类平均尺寸的偏差
-        # 上面不会出错，虽然semantic_map会将wall,floor,ceiling映射到-100,但预处理中已经去除了instance_bbox中属于这3类的bbox
-        # 所以DC.mean_size_arr不会出现indexError
+        # 上面不会出错，虽然semantic_map会将ceiling映射到-100,但预处理中已经去除了instance_bbox中属于这类的bbox
+        # 所以DC.mean_size_arr不会出现indexError，减2是因为不考虑wall和floor这两类
 
         # construct the reference target label for each bbox
         for i, gt_id in enumerate(instance_bboxes[:num_bbox, -1]):
@@ -680,16 +691,16 @@ class ScannetReferenceDataset(ReferenceDataset):
         data_dict["num_bbox"] = np.array(num_bbox).astype(np.int64)  # 该scene中共有多少instances（bounding box）
         data_dict["box_label_mask"] = target_bboxes_mask.astype(
             np.float32)  # (MAX_NUM_OBJ) as 0/1 with 1 indicating a unique box,1表示有bbox，0表示无
-        data_dict["center_label"] = target_bboxes.astype(np.float32)[:,
-                                    0:3]  # (MAX_NUM_OBJ, 3) for GT box center XYZ，即所有gt box的中心坐标
+        data_dict["center_label"] = torch.from_numpy(target_bboxes.astype(np.float32)[:,
+                                                     0:3])  # (MAX_NUM_OBJ, 3) for GT box center XYZ，即所有gt box的中心坐标
         data_dict["size_class_label"] = size_classes.astype(
             np.int64)  # (MAX_NUM_OBJ,) with int values in 0,...,NUM_SIZE_CLUSTER，表示每个object对应的class(0-17)
         data_dict["size_residual_label"] = size_residuals.astype(np.float32)  # (MAX_NUM_OBJ, 3) 每个object的尺寸
 
         # GT bounding box corner相关，即该train sample中对应的物体的bbox的corners坐标
         # ----------------------------------------------------------------------
-        data_dict["gt_box_corner_label"] = gt_box_corner_label.astype(
-            np.float64)  # (MAX_NUM_OBJ，8，3) 所有 GT box的corners，NOTE type must be double
+        data_dict["gt_box_corner_label"] = torch.from_numpy(gt_box_corner_label.astype(
+            np.float64))  # (MAX_NUM_OBJ，8，3) 所有 GT box的corners，NOTE type must be double
         data_dict["gt_box_masks"] = gt_box_masks.astype(np.int64)  # (MAX_NUM_OBJ)，1表示有bbox，0表示无
         data_dict["gt_box_object_ids"] = gt_box_object_ids.astype(np.int64)  # 各GT bbox对应的object ids
 
@@ -707,7 +718,8 @@ class ScannetReferenceDataset(ReferenceDataset):
         # target相关
         # ----------------------------------------------------------------------
         data_dict["sem_cls_label"] = target_bboxes_semcls.astype(np.int64)  # (MAX_NUM_OBJ,)，object对应的semantic class
-        data_dict["scene_object_ids"] = target_object_ids.astype(np.int64)  # (MAX_NUM_OBJ,)，object对应的object_id
+        data_dict["scene_object_ids"] = torch.from_numpy(
+            target_object_ids.astype(np.int64))  # (MAX_NUM_OBJ,)，object对应的object_id
 
         # unique_multiple，0表示该物体类型在场景中只有一个，1则表示该场景中有多个该种object
         data_dict["unique_multiple"] = np.array(self.unique_multiple_lookup[scene_id][str(object_id)][ann_id]).astype(
@@ -780,6 +792,9 @@ class ScannetReferenceDataset(ReferenceDataset):
         lang_ids = torch.cat([batch[i]['lang_ids'].unsqueeze(0) for i in range(len(batch))], 0)
         ref_size_label = torch.cat([batch[i]['ref_size_label'].unsqueeze(0) for i in range(len(batch))], 0)
         ref_center_label = torch.cat([batch[i]['ref_center_label'].unsqueeze(0) for i in range(len(batch))], 0)
+        center_label = torch.cat([batch[i]['center_label'].unsqueeze(0) for i in range(len(batch))], 0)
+        scene_object_ids = torch.cat([batch[i]['scene_object_ids'].unsqueeze(0) for i in range(len(batch))], 0)
+        gt_box_corner_label = torch.cat([batch[i]['gt_box_corner_label'].unsqueeze(0) for i in range(len(batch))], 0)
 
         spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, self.voxel_cfg.spatial_shape[0], None)
 
@@ -807,12 +822,14 @@ class ScannetReferenceDataset(ReferenceDataset):
             'object_id': object_id,
             'ref_size_label': ref_size_label,
             'ref_center_label': ref_center_label,
+            'center_label': center_label,
+            'gt_box_corner_label': gt_box_corner_label,
+            'scene_object_ids': scene_object_ids,
 
             # caption module need
             'lang_feat': lang_feat,
             'lang_len': lang_len,
             'lang_ids': lang_ids,
-
 
         }
 

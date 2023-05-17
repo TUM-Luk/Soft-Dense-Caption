@@ -35,7 +35,7 @@ CONF.voxel_cfg.min_npoint = 5000
 
 # grouping_cfg
 CONF.grouping_cfg = EasyDict()
-CONF.grouping_cfg.max_num_proposal = 64 #最多group几个
+CONF.grouping_cfg.max_num_proposal = 128 #最多group几个
 CONF.grouping_cfg.score_thr = 0.2  # 0.2, 0.05是用来debug的
 CONF.grouping_cfg.radius = 0.04
 CONF.grouping_cfg.mean_active = 300
@@ -47,7 +47,7 @@ CONF.grouping_cfg.class_numpoint_mean = [-1, -1, 3917., 12056., 2303.,
                                          4136., 2120., 945., 3967., 2589.]
 # train_cfg
 CONF.train_cfg = EasyDict()
-CONF.train_cfg.max_proposal_num = 64 #最多有几个proposal
+CONF.train_cfg.max_proposal_num = 128 #最多有几个proposal
 CONF.train_cfg.pos_iou_thr = 0.5
 
 # instance_voxel_cfg
@@ -62,3 +62,6 @@ CONF.test_cfg.x4_split = False
 CONF.test_cfg.cls_score_thr = 0.001
 CONF.test_cfg.mask_score_thr = -0.5
 CONF.test_cfg.eval_tasks = ['semantic', 'instance']
+
+# output
+CONF.PATH.OUTPUT = os.path.join(CONF.PATH.BASE, "outputs")

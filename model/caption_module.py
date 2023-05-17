@@ -5,39 +5,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-sys.path.append(os.path.join(os.getcwd())) # HACK add the root folder
+sys.path.append(os.path.join(os.getcwd()))  # HACK add the root folder
 from data.scannet.model_util_scannet import ScannetDatasetConfig
 from lib.config import CONF
 from utils.box_util import box3d_iou_batch_tensor
 
 # constants
 DC = ScannetDatasetConfig()
+
+
 def select_target(data_dict):
     # predicted bbox
-    pred_bbox = data_dict["bbox_corner"] # batch_size, num_proposals, 8, 3
+    pred_bbox = data_dict["bbox_corner"]  # batch_size, num_proposals, 8, 3
     batch_size, num_proposals, _, _ = pred_bbox.shape
 
     # ground truth bbox
-    gt_bbox = data_dict["ref_box_corner_label"] # batch_size, 8, 3
+    gt_bbox = data_dict["ref_box_corner_label"]  # batch_size, 8, 3
 
     target_ids = []
     target_ious = []
     for i in range(batch_size):
         # convert the bbox parameters to bbox corners
-        pred_bbox_batch = pred_bbox[i] # num_proposals, 8, 3
-        gt_bbox_batch = gt_bbox[i].unsqueeze(0).repeat(num_proposals, 1, 1) # num_proposals, 8, 3
+        pred_bbox_batch = pred_bbox[i]  # num_proposals, 8, 3
+        gt_bbox_batch = gt_bbox[i].unsqueeze(0).repeat(num_proposals, 1, 1)  # num_proposals, 8, 3
         ious = box3d_iou_batch_tensor(pred_bbox_batch, gt_bbox_batch)
-        target_id = ious.argmax().item() # 0 ~ num_proposals - 1
+        target_id = ious.argmax().item()  # 0 ~ num_proposals - 1
         target_ids.append(target_id)
         target_ious.append(ious[target_id])
 
-    target_ids = torch.LongTensor(target_ids).cuda() # batch_size
-    target_ious = torch.FloatTensor(target_ious).cuda() # batch_size
+    target_ids = torch.LongTensor(target_ids).cuda()  # batch_size
+    target_ious = torch.FloatTensor(target_ious).cuda()  # batch_size
 
     return target_ids, target_ious
 
+
 class CaptionModule(nn.Module):
-    def __init__(self, vocabulary, embeddings, emb_size=300, feat_size=32, hidden_size=512, num_proposals=256):
+    def __init__(self, vocabulary, embeddings, emb_size=300, feat_size=32, hidden_size=512, num_proposals=128):
         super().__init__()
 
         self.vocabulary = vocabulary
@@ -56,22 +59,22 @@ class CaptionModule(nn.Module):
         )
 
         # captioning core 主体部分
-        self.recurrent_cell = nn.GRUCell(
+        self.recurrent_cell = nn.LSTMCell(
             input_size=emb_size,
             hidden_size=emb_size
         )
         # 输出分类层
         self.classifier = nn.Linear(emb_size, self.num_vocabs)
 
-    def step(self, step_input, hidden):
-        hidden = self.recurrent_cell(step_input, hidden)  # num_proposals, emb_size
+    def step(self, step_input, hidden, cell):
+        (hidden, cell) = self.recurrent_cell(step_input, (hidden, cell))  # num_proposals, emb_size
 
-        return hidden, hidden
+        return hidden, hidden, cell
 
-    def compute_loss(self,data_dict):
-        pred_caps = data_dict['lang_cap'] # (B, num_words - 1, num_vocabs)
+    def compute_loss(self, data_dict):
+        pred_caps = data_dict['lang_cap']  # (B, num_words - 1, num_vocabs)
         num_words = data_dict['lang_len'].max()
-        target_caps = data_dict['lang_ids'][:,1:num_words] # (B, num_words - 1)
+        target_caps = data_dict['lang_ids'][:, 1:num_words]  # (B, num_words - 1)
 
         _, _, num_vocabs = pred_caps.shape
 
@@ -104,10 +107,9 @@ class CaptionModule(nn.Module):
     def forward(self, data_dict, use_tf=True, is_eval=False, max_len=CONF.TRAIN.MAX_DES_LEN):
         if not is_eval:
             data_dict = self.forward_sample_batch(data_dict, max_len)
+            data_dict['cap_loss'], data_dict['cap_acc'] = self.compute_loss(data_dict)
         else:
             data_dict = self.forward_scene_batch(data_dict, use_tf, max_len)
-
-        data_dict['cap_loss'], data_dict['cap_acc'] = self.compute_loss(data_dict)
 
         return data_dict
 
@@ -138,11 +140,12 @@ class CaptionModule(nn.Module):
         # recurrent from 0 to max_len - 2
         outputs = []
         hidden = obj_feats  # batch_size, emb_size
+        cell = torch.zeros(batch_size, self.emb_size).cuda()
         step_id = 0
         step_input = word_embs[:, step_id]  # batch_size, emb_size
         while True:
             # feed
-            step_output, hidden = self.step(step_input, hidden)
+            step_output, hidden, cell = self.step(step_input, hidden, cell)
             step_output = self.classifier(step_output)  # batch_size, num_vocabs
 
             # store
@@ -181,7 +184,7 @@ class CaptionModule(nn.Module):
         # unpack
         word_embs = data_dict["lang_feat"]  # batch_size, max_len, emb_size
         des_lens = data_dict["lang_len"]  # batch_size
-        obj_feats = data_dict["bbox_feature"]  # batch_size, num_proposals, feat_size
+        obj_feats = data_dict["clus_feats_batch"]  # batch_size, num_proposals, feat_size
 
         num_words = des_lens.max()
         batch_size = des_lens.shape[0]
@@ -198,11 +201,12 @@ class CaptionModule(nn.Module):
             # start recurrence
             prop_outputs = []
             hidden = target_feats  # batch_size, emb_size
+            cell = torch.zeros(batch_size, self.emb_size).cuda()
             step_id = 0
-            step_input = word_embs[:, step_id]  # batch_size, emb_size
+            step_input = word_embs[:, step_id]  # batch_size, emb_size 一开始即soc的embedding
             while True:
                 # feed
-                step_output, hidden = self.step(step_input, hidden)
+                step_output, hidden, cell = self.step(step_input, hidden, cell)
                 step_output = self.classifier(step_output)  # batch_size, num_vocabs
 
                 # predicted word
