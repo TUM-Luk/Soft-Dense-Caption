@@ -1,2 +1,1 @@
-# DenseCap
-gaga
+# Soft-Dense-Caption
