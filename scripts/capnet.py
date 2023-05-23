@@ -6,19 +6,25 @@ import os
 import json
 import pickle
 import pytorch_lightning as pl
+from torch.utils.tensorboard import SummaryWriter
 
-from model.softgroup_module import SoftGroup
-from model.proposal_module import ProposalModule
 from model.caption_module import CaptionModule
+from model.softgroup import SoftGroup
 
+from model.evaluation import (PanopticEval, ScanNetEval, evaluate_offset_mae,
+                              evaluate_semantic_acc, evaluate_semantic_miou)
 from utils.nn_distance import nn_distance
 from utils.box_util import box3d_iou_batch_tensor
-from utils.val_helper import decode_caption, check_candidates, organize_candidates, prepare_corpus, compute_acc
+
+from utils.val_helper import decode_caption, check_candidates, organize_candidates, prepare_corpus, compute_acc, \
+    collect_results_cpu
 
 import lib.capeval.bleu.bleu as capblue
 import lib.capeval.cider.cider as capcider
 import lib.capeval.rouge.rouge as caprouge
 import lib.capeval.meteor.meteor as capmeteor
+
+from lib.capeval.bleu.bleu_scorer import BleuScorer
 
 sys.path.append(os.path.join(os.getcwd(), "lib"))  # HACK add the lib folder
 from lib.config import CONF
@@ -28,18 +34,22 @@ GLOVE_PICKLE = os.path.join(CONF.PATH.DATA, "glove.p")
 
 
 class CapNet(pl.LightningModule):
-    def __init__(self):
+    def __init__(self, val_tf_on=False):
         super().__init__()
+        self.writer = SummaryWriter("logs/")  # 指定TensorBoard日志保存路径
+        self.results = []
         self.vocabulary = json.load(open(vocab_path))
         self.embeddings = pickle.load(open(GLOVE_PICKLE, "rb"))
         self.organized = json.load(open(os.path.join(CONF.PATH.DATA, "scanrefer/ScanRefer_filtered_organized.json")))
         self.candidates = {}
-        self.cap_acc = []
-        self.cap_loss = []
+        self.val_tf_on = val_tf_on
+        self.CLASSES = ('cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf', 'picture',
+                        'counter', 'desk', 'curtain', 'refrigerator', 'shower curtain', 'toilet', 'sink',
+                        'bathtub', 'otherfurniture')
         # Define the model
         # -------------------------------------------------------------
         # ----------- SoftGroup-based Detection Backbone --------------
-        self.softgroup_module = SoftGroup(in_channels=6,
+        self.softgroup_module = SoftGroup(in_channels=3,
                                           channels=32,
                                           num_blocks=7,
                                           semantic_classes=20,
@@ -51,107 +61,100 @@ class CapNet(pl.LightningModule):
                                           test_cfg=CONF.test_cfg,
                                           fixed_modules=[])
 
-        # --------------------- Proposal Module -----------------------
-        self.proposal_module = ProposalModule(in_channels=32, out_channels=6, num_layers=2)
+        # # --------------------- Proposal Module -----------------------
+        # self.proposal_module = ProposalModule(in_channels=32, out_channels=6, num_layers=2)
 
         # --------------------- Captioning Module ---------------------
         self.caption_module = CaptionModule(self.vocabulary, self.embeddings, emb_size=300, feat_size=32,
                                             hidden_size=512, num_proposals=CONF.train_cfg.max_proposal_num)
 
     def forward_train(self, batch):
-        # semantic segmentation/grouping cluster/get cluster features
-        batch['clus_feats_batch'], batch['select_feats'], batch['losses'], batch[
-            'good_clu_masks'] = self.softgroup_module.forward(**batch)
-        # predict bboxes
-        self.proposal_module.forward(batch)
+        (loss, log_vars), batch['select_feats'], batch['good_clu_masks'], batch['object_feats'], batch[
+            'object_mask'] = self.softgroup_module.forward(batch, return_loss=True)
+
         # predict language_features
-        self.caption_module.forward(batch)
+        batch = self.caption_module.forward(batch)
 
-        return batch
+        return loss, log_vars, batch
 
-    def forward_val(self, batch):
-        # 新加的
-        batch_size = batch['batch_size']
-        num_proposals = CONF.train_cfg.max_proposal_num
-        batch['clus_feats_batch'], batch['clus_center_batch'], batch['valid_clu_masks'], batch[
-            'losses'] = self.softgroup_module.forward_val(
-            **batch)
-        # predict bboxes
-        self.proposal_module.forward_val(batch)
-        # predict language_features
-        self.caption_module.forward(batch, use_tf=False, is_eval=True)
-        captions = batch['lang_cap'].argmax(-1)
-        gt_center = batch['center_label'][:, :, 0:3]
-        _, batch['object_assignment'], _, _ = nn_distance(batch['clus_center_batch'], gt_center)
+    def training_step(self, batch):
+        loss, log_vars, batch = self.forward_train(batch)
+        semantic_loss = log_vars['semantic_loss']
+        offset_loss = log_vars['offset_loss']
+        cls_loss = log_vars['cls_loss']
+        mask_loss = log_vars['mask_loss']
+        iou_score_loss = log_vars['iou_score_loss']
+        cap_loss = batch['cap_loss']
+        cap_acc = batch['cap_acc']
+        loss = loss + 0.1 * cap_loss
 
-        # pick out object ids of detected objects
-        detected_object_ids = torch.gather(batch["scene_object_ids"], 1, batch["object_assignment"])
+        self.log("semantic_loss_train", semantic_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("offset_loss", offset_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("cls_loss", cls_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("mask_loss", mask_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("iou_score_loss", iou_score_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("cap_loss", cap_loss, on_step=True, prog_bar=True, logger=True)
+        self.log("cap_acc", cap_acc, on_step=True, prog_bar=True, logger=True)
 
-        # bbox corners
-        assigned_target_bbox_corners = torch.gather(
-            batch["gt_box_corner_label"],
-            1,
-            batch["object_assignment"].view(batch_size, num_proposals, 1, 1).repeat(1, 1, 8, 3)
-        )  # batch_size, num_proposals, 8, 3
-        detected_bbox_corners = batch["bbox_corner"]  # batch_size, num_proposals, 8, 3
+        return loss
 
-        # compute IoU between each detected box and each ground truth box
-        ious = box3d_iou_batch_tensor(
-            assigned_target_bbox_corners.view(-1, 8, 3),  # batch_size * num_proposals, 8, 3
-            detected_bbox_corners.view(-1, 8, 3)  # batch_size * num_proposals, 8, 3
-        ).view(batch_size, num_proposals)
-
-        min_iou = 0
-        # find good boxes (IoU > threshold)
-        good_bbox_masks = ious > min_iou  # batch_size, num_proposals
-
-        object_attn_masks = {}
-        for batch_id in range(batch_size):
-            scene_id = batch["scan_ids"][batch_id]
-            object_attn_masks[scene_id] = np.zeros((num_proposals, num_proposals))
-            for prop_id in range(num_proposals):
-                if batch['valid_clu_masks'][batch_id, prop_id] == 1 and good_bbox_masks[batch_id, prop_id] == 1:
-                    object_id = str(detected_object_ids[batch_id, prop_id].item())
-                    caption_decoded = decode_caption(captions[batch_id, prop_id], self.vocabulary["idx2word"])
-
-                    # print(scene_id, object_id)
-                    try:
-                        ann_list = list(self.organized[scene_id][object_id].keys())
-                        object_name = self.organized[scene_id][object_id][ann_list[0]]["object_name"]
-
-                        # store
-                        key = "{}|{}|{}".format(scene_id, object_id, object_name)
-                        # key = "{}|{}".format(scene_id, object_id)
-                        self.candidates[key] = [caption_decoded]
-
-                    except KeyError:
-                        continue
-        print('ceshi')
-        print(self.candidates)
-
-        return batch
+    def on_train_epoch_end(self):
+        filepath = f'model0523_pretrain_attention_decay{self.current_epoch}.ckpt'
+        self.trainer.save_checkpoint(filepath)
 
     def validation_step(self, batch, batch_idx):
         if batch_idx == 0:
-            self.candidates = {}  # 每次val开始时，重置candidates
+            self.candidates = {}
+        if self.val_tf_on:
+            loss, log_vars, batch = self.forward_train(batch)
+            captions = batch['lang_cap'].argmax(-1)
+            for i in range(batch['batch_size']):
+                caption_decoded = decode_caption(captions[i], self.vocabulary["idx2word"])
 
-        batch = self.forward_val(batch)
-        semantic_loss = batch['losses']['semantic_loss']
-        offset_loss = batch['losses']['offset_loss']
-        print("validation test!!!!!!!!!")
-        print('sem_loss is: ', semantic_loss)
-        print('offset_loss is: ', offset_loss)
+            semantic_loss = log_vars['semantic_loss']
+            offset_loss = log_vars['offset_loss']
+            cls_loss = log_vars['cls_loss']
+            mask_loss = log_vars['mask_loss']
+            iou_score_loss = log_vars['iou_score_loss']
+            cap_loss = batch['cap_loss']
+            cap_acc = batch['cap_acc']
+            self.log("val_semantic_loss_train", semantic_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_offset_loss", offset_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_cls_loss", cls_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_mask_loss", mask_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_iou_score_loss", iou_score_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_cap_loss", cap_loss, on_step=True, prog_bar=True, logger=True)
+            self.log("val_cap_acc", cap_acc, on_step=True, prog_bar=True, logger=True)
 
+        if not self.val_tf_on:
+            (loss, log_vars), batch['select_feats'], batch['good_clu_masks'], batch['object_feats'], batch[
+                'object_mask'] = self.softgroup_module.forward(batch, return_loss=True)
+
+            # predict language_features without tf
+            batch = self.caption_module.forward_sample_val(batch, use_tf=False)
+
+            captions = batch['lang_cap'].argmax(-1)
+
+            for i in range(batch['batch_size']):
+                caption_decoded = decode_caption(captions[i], self.vocabulary["idx2word"])
+                scene_id = str(batch['scan_ids'][i])
+                object_id = str(int(batch['object_id'][i]))
+                try:
+                    ann_list = list(self.organized[scene_id][object_id].keys())
+                    object_name = self.organized[scene_id][object_id][ann_list[0]]["object_name"]
+                    # store
+                    key = "{}|{}|{}".format(scene_id, object_id, object_name)
+                    self.candidates[key] = [caption_decoded]
+
+                except KeyError:
+                    continue
         return None
 
     def on_validation_end(self):
-        # prepare corpus
-        corpus_path = os.path.join(CONF.PATH.OUTPUT, "corpus_{}.json".format('val'))
+        corpus_path = os.path.join(CONF.PATH.OUTPUT,"corpus_val.json")
         if not os.path.exists(corpus_path):
             print("preparing corpus...")
-            raw_data = json.load(
-                open(os.path.join(CONF.PATH.DATA, "scanrefer/ScanRefer_filtered_{}.json".format('val'))))
-
+            raw_data = json.load(open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_val.json")))
             corpus = prepare_corpus(raw_data, CONF.TRAIN.MAX_DES_LEN)
             with open(corpus_path, "w") as f:
                 json.dump(corpus, f, indent=4)
@@ -160,45 +163,30 @@ class CapNet(pl.LightningModule):
             with open(corpus_path) as f:
                 corpus = json.load(f)
 
-        # check candidates
-        # NOTE: make up the captions for the undetected object by "sos eos"
-        candidates = check_candidates(corpus, self.candidates)
-        candidates = organize_candidates(corpus, candidates)
+        self.candidates = check_candidates(corpus, self.candidates)
+        self.candidates = organize_candidates(corpus, self.candidates)
 
-        # save the predict captions
-        pred_path = os.path.join(CONF.PATH.OUTPUT, "pred_{}.json".format('val'))
-
+        pred_path = os.path.join(CONF.PATH.OUTPUT, "pred_val.json")
+        print("generating descriptions...")
         with open(pred_path, "w") as f:
-            json.dump(candidates, f, indent=4)
+            json.dump(self.candidates, f, indent=4)
 
         print("computing scores...")
+        bleu = capblue.Bleu(4).compute_score(corpus, self.candidates)
+        cider = capcider.Cider().compute_score(corpus, self.candidates)
+        rouge = caprouge.Rouge().compute_score(corpus, self.candidates)
+        self.logger.experiment.add_scalar("bleu-1", bleu[0][0],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-2", bleu[0][1],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-3", bleu[0][2],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-4", bleu[0][3],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("cider", cider[0],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("rouge", rouge[0],global_step=self.current_epoch)
 
-        bleu = capblue.Bleu(4).compute_score(corpus, candidates)
-        # cider = capcider.Cider().compute_score(corpus, candidates)
-        # rouge = caprouge.Rouge().compute_score(corpus, candidates)
-        # meteor = capmeteor.Meteor().compute_score(corpus, candidates)
-        print("validation数据集的bleu为：", bleu[0])
-        return bleu
+        print(bleu[0])
+        print(cider[0])
+        print(rouge[0])
 
-    def training_step(self, batch):
-        batch = self.forward_train(batch)
-        semantic_loss = batch['losses']['semantic_loss']
-        offset_loss = batch['losses']['offset_loss']
-        bbox_loss = batch['bbox_loss']
-        cap_loss = batch['cap_loss']
-        cap_acc = batch['cap_acc']
-        print('sem_loss is: ', semantic_loss)
-        print('offset_loss is: ', offset_loss)
-        print('bbox_loss is: ', bbox_loss)
-        print('cap_loss is: ', cap_loss)
-        print('cap_acc is: ', cap_acc)
-        self.log("semantic_loss_train", semantic_loss, on_step=True, prog_bar=True, logger=True)
-        loss = 10 * (semantic_loss + offset_loss) + 1 * bbox_loss + 0.1 * cap_loss
-        return loss
-
-    def on_train_epoch_end(self):
-        filepath = f'model_checkpoint_epoch{self.current_epoch}.ckpt'
-        self.trainer.save_checkpoint(filepath)
+        return None
 
     def visualization_softgroup(self, batch):
         # semantic preds/instance preds
@@ -226,8 +214,11 @@ class CapNet(pl.LightningModule):
         return result
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.001, weight_decay=1e-5)
         return optimizer
+
+    def test_step(self, batch, batch_idx):
+        return None
 
 # 单个val（用于debug)
 #     def validation_step(self, batch, batch_idx):

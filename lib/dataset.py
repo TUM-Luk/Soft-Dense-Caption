@@ -92,6 +92,10 @@ def get_scanrefer(model=None):
     for data in scanrefer_train:
         if data["scene_id"] in train_scene_list:
             new_scanrefer_train.append(data)
+    # for scene_id in train_scene_list:
+    #     data = deepcopy(SCANREFER_TRAIN[0])
+    #     data["scene_id"] = scene_id
+    #     new_scanrefer_train.append(data)
 
     # eval on train
     new_scanrefer_eval_train = []
@@ -102,14 +106,14 @@ def get_scanrefer(model=None):
 
     # eval on val
     new_scanrefer_eval_val = []
-    for scene_id in val_scene_list:
-        data = deepcopy(SCANREFER_TRAIN[0])
-        data["scene_id"] = scene_id
-        new_scanrefer_eval_val.append(data)
-
-    # for data in scanrefer_eval_val:
-    #     if data["scene_id"] in val_scene_list:
-    #         new_scanrefer_eval_val.append(data)
+    for data in scanrefer_eval_val:
+        if data["scene_id"] in val_scene_list:
+            new_scanrefer_eval_val.append(data)
+    #
+    # for scene_id in val_scene_list:
+    #     data = deepcopy(SCANREFER_TRAIN[0])
+    #     data["scene_id"] = scene_id
+    #     new_scanrefer_eval_val.append(data)
 
     # all scanrefer scene
     all_scene_list = train_scene_list + val_scene_list
@@ -470,7 +474,16 @@ class ScannetReferenceDataset(ReferenceDataset):
             spatial_shape[:2] -= step_temp
         return xyz_offset, valid_idxs
 
-    def transform_train(self, xyz, rgb, semantic_label, instance_label, aug_prob=1.0):
+    def getCroppedInstLabel(self, instance_label, valid_idxs):
+        instance_label = instance_label[valid_idxs]
+        j = 0
+        while (j < instance_label.max()):
+            if (len(np.where(instance_label == j)[0]) == 0):
+                instance_label[instance_label == instance_label.max()] = j
+            j += 1
+        return instance_label
+
+    def transform_train(self, xyz, rgb, semantic_label, instance_label, object_id_labels, aug_prob=1.0):
         if self.augment == True:
             xyz_middle = self.dataAugment(xyz, True, True, True, True, aug_prob)
         else:
@@ -493,19 +506,17 @@ class ScannetReferenceDataset(ReferenceDataset):
         xyz_middle = xyz_middle[valid_idxs]
         rgb = rgb[valid_idxs]
         semantic_label = semantic_label[valid_idxs]
-        instance_label = instance_label[valid_idxs]
-        return xyz, xyz_middle, rgb, semantic_label, instance_label
+        object_id_labels = object_id_labels[valid_idxs]
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+        return xyz, xyz_middle, rgb, semantic_label, instance_label, object_id_labels
 
-    def transform_test(self, xyz, rgb, semantic_label, instance_label):
-        if self.augment == True:
-            xyz_middle = self.dataAugment(xyz, False, False, False, False)
-        else:
-            xyz_middle = xyz
+    def transform_test(self, xyz, rgb, semantic_label, instance_label, object_id_labels):
+        xyz_middle = self.dataAugment(xyz, False, False, False, False)
         xyz = xyz_middle * self.voxel_cfg.scale
         xyz -= xyz.min(0)
         valid_idxs = np.ones(xyz.shape[0], dtype=bool)
-        instance_label = instance_label[valid_idxs]
-        return xyz, xyz_middle, rgb, semantic_label, instance_label
+        instance_label = self.getCroppedInstLabel(instance_label, valid_idxs)
+        return xyz, xyz_middle, rgb, semantic_label, instance_label, object_id_labels
 
     # instance_num instance的数量（int）
     # instance_pointnum：列表，存储了属于每个instance的点的数量
@@ -519,10 +530,6 @@ class ScannetReferenceDataset(ReferenceDataset):
         instance_num = max(int(instance_label.max()) + 1, 0)
         for i_ in range(instance_num):
             inst_idx_i = np.where(instance_label == i_)
-            if inst_idx_i[0].size == 0:  # 因为在前处理时，有些instance比如ceiling已经被删除了，所以可能会有空余的instance_label
-                instance_pointnum.append(inst_idx_i[0].size)
-                instance_cls.append(-100)
-                continue
             xyz_i = xyz[inst_idx_i]  # 对应instance_id为i的所有点坐标
             pt_mean[inst_idx_i] = xyz_i.mean(0)  # 这个instance的所有点的mean
             instance_pointnum.append(inst_idx_i[0].size)
@@ -558,6 +565,13 @@ class ScannetReferenceDataset(ReferenceDataset):
         instance_labels = instance_labels - 1
         instance_labels[instance_labels == -1] = -100
 
+        # 创建object_id_labels
+        object_id_labels = np.copy(instance_labels)
+
+        # 忽略属于wall和floor的instance
+        ign_idx = np.logical_or(semantic_labels == 0, semantic_labels == 1)
+        instance_labels[ign_idx] = -100
+
         point_cloud = mesh_vertices[:, 0:6]
         # 对坐标数据预处理,让其中心为(0,0,0),目的是为了后面的transform的scale放大操作
         # 对instance_bbox也中心化
@@ -573,20 +587,30 @@ class ScannetReferenceDataset(ReferenceDataset):
             instance_labels = instance_labels[choices]
             semantic_labels = semantic_labels[choices]
             semantic_labels_nyu40id = semantic_labels_nyu40id[choices]
+            object_id_labels = object_id_labels[choices]
             pcl_color = pcl_color[choices]
 
         # --------------------------- FEAT used for SOFTGROUP -----------------------------
         # 对数据做augmentation，xyz_middle为augment之后坐标，xyz为平移+放大xyz_middle之后的坐标（用于voxelization)
         if self.augment:
-            data = self.transform_train(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels, 1)
+            data = self.transform_train(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels,
+                                        object_id_labels, 1)
         else:
-            data = self.transform_test(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels)
-        xyz, xyz_middle, rgb, semantic_labels, instance_labels = data
+            data = self.transform_test(point_cloud[:, 0:3], point_cloud[:, 3:6], semantic_labels, instance_labels,
+                                       object_id_labels)
+        xyz, xyz_middle, rgb, semantic_labels, instance_labels, object_id_labels = data
         point_cloud = np.concatenate((xyz_middle, rgb), axis=1)
 
         # 得到场景内instance总数，每个instance中点的数量，instance所属label，点偏移量
         info = self.getInstanceInfo(xyz_middle, instance_labels, semantic_labels)
         inst_num, inst_pointnum, inst_cls, pt_offset_label = info
+        inst_cls = [x - 2 if x != -100 else x for x in inst_cls]  # 对应的instance_class (0-17,去除了Wall和floor）
+
+        # 与该sample的object_id对应的instance_id
+        if np.where(object_id_labels == object_id)[0].size != 0:
+            instance_id = instance_labels[np.where(object_id_labels == object_id)[0][0]]
+        else:
+            instance_id = -100
 
         # ------------------------------- LABELS ------------------------------
         target_bboxes = np.zeros((MAX_NUM_OBJ, 6))  # 场景内所有bbox的坐标+尺寸
@@ -665,6 +689,7 @@ class ScannetReferenceDataset(ReferenceDataset):
         data_dict["feat"] = torch.from_numpy(rgb).float()  # 点特征信息，这里是rgb color
         data_dict["semantic_label"] = torch.from_numpy(semantic_labels)
         data_dict["instance_label"] = torch.from_numpy(np.array(instance_labels).astype(np.int64))
+        data_dict["object_id_label"] = torch.from_numpy(np.array(object_id_labels).astype(np.int64))
         data_dict["inst_num"] = np.array(inst_num).astype(np.int64)
         data_dict["inst_pointnum"] = np.array(inst_pointnum).astype(np.int64)
         data_dict["inst_cls"] = np.array(inst_cls).astype(np.int64)
@@ -676,6 +701,7 @@ class ScannetReferenceDataset(ReferenceDataset):
         data_dict["pcl_color"] = pcl_color
         data_dict["semantic_label_nyu40id"] = np.array(semantic_labels_nyu40id).astype(np.int64)
         data_dict["object_id"] = torch.from_numpy(np.array(int(object_id)).astype(np.int64))  # 该物体在场景中的id
+        data_dict["instance_id"] = torch.from_numpy(np.array(int(instance_id)).astype(np.int64))  # 该物体对应的instance_id
         data_dict["object_cat"] = np.array(object_cat).astype(np.int64)  # 该物体对应的category（0-17）
         data_dict["ann_id"] = np.array(int(ann_id)).astype(np.int64)  # 该描述的id
 
@@ -737,10 +763,12 @@ class ScannetReferenceDataset(ReferenceDataset):
         feats = []
         semantic_labels = []
         instance_labels = []
+        object_id_labels = []
+        instance_ids = []
         instance_pointnum = []  # (total_nInst), int
         instance_cls = []  # (total_nInst), long
         pt_offset_labels = []
-
+        inst_nums = []
         total_inst_num = 0
         batch_id = 0
 
@@ -754,21 +782,30 @@ class ScannetReferenceDataset(ReferenceDataset):
             feat = data["feat"]
             semantic_label = data["semantic_label"]
             instance_label = data["instance_label"]
+            object_id_label = data["object_id_label"]
             inst_num = data["inst_num"]
             inst_pointnum = data["inst_pointnum"]
             inst_cls = data["inst_cls"]
             pt_offset_label = data["pt_offset_label"]
+            instance_id = data['instance_id']
 
             # append
+            instance_label[np.where(instance_label != -100)] += total_inst_num
+            instance_id += total_inst_num
+
+            total_inst_num += inst_num
             scan_ids.append(scan_id)
             coords.append(torch.cat([coord.new_full((coord.size(0), 1), batch_id), coord], 1))
             coords_float.append(coord_float)
             feats.append(feat)
             semantic_labels.append(semantic_label)
             instance_labels.append(instance_label)
+            object_id_labels.append(object_id_label)
+            instance_ids.append(instance_id)
             instance_pointnum.extend(inst_pointnum)
             instance_cls.extend(inst_cls)
             pt_offset_labels.append(pt_offset_label)
+            inst_nums.append(inst_num)
             batch_id += 1
 
         assert batch_id > 0, 'empty batch'
@@ -782,6 +819,9 @@ class ScannetReferenceDataset(ReferenceDataset):
         feats = torch.cat(feats, 0)  # float (N, C)
         semantic_labels = torch.cat(semantic_labels, 0).long()  # long (N)
         instance_labels = torch.cat(instance_labels, 0).long()  # long (N)
+        object_id_labels = torch.cat(object_id_labels, 0).long()  # long (B)
+        instance_ids = torch.tensor(instance_ids)  # long (B)
+        inst_nums = torch.tensor(np.asarray(inst_nums), dtype=torch.int)
         instance_pointnum = torch.tensor(instance_pointnum, dtype=torch.int)  # int (total_nInst)
         instance_cls = torch.tensor(instance_cls, dtype=torch.long)  # long (total_nInst)
         pt_offset_labels = torch.cat(pt_offset_labels).float()
@@ -812,14 +852,17 @@ class ScannetReferenceDataset(ReferenceDataset):
             'feats': feats,
             'semantic_labels': semantic_labels,
             'instance_labels': instance_labels,
+            'object_id_labels': object_id_labels,
             'instance_pointnum': instance_pointnum,
             'instance_cls': instance_cls,
             'pt_offset_labels': pt_offset_labels,
             'spatial_shape': spatial_shape,
+            'inst_nums': inst_nums,
             'batch_size': batch_id,
 
             # proposal module need
             'object_id': object_id,
+            'instance_id': instance_ids,
             'ref_size_label': ref_size_label,
             'ref_center_label': ref_center_label,
             'center_label': center_label,

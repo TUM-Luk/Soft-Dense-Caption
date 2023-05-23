@@ -47,7 +47,7 @@ CONF.grouping_cfg.class_numpoint_mean = [-1, -1, 3917., 12056., 2303.,
                                          4136., 2120., 945., 3967., 2589.]
 # train_cfg
 CONF.train_cfg = EasyDict()
-CONF.train_cfg.max_proposal_num = 128 #最多有几个proposal
+CONF.train_cfg.max_proposal_num = 1024 #最多有几个proposal
 CONF.train_cfg.pos_iou_thr = 0.5
 
 # instance_voxel_cfg

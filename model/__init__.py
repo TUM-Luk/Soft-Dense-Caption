@@ -1,3 +1,3 @@
-from .softgroup_module import SoftGroup
+from .softgroup import SoftGroup
 
 __all__ = ['SoftGroup']

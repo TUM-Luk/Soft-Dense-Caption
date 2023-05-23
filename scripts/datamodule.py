@@ -30,8 +30,8 @@ class ScanReferDataModule(pl.LightningDataModule):
             scanrefer=self.Scanrefer_train,
             scanrefer_all_scene=self.all_scene_list,
             split='train',
-            num_points=40000,
-            augment=False,
+            num_points=50000,
+            augment=True,
         )
         self.dataset_val = ScannetReferenceDataset(
             scanrefer=self.Scanrefer_eval_val,
@@ -52,30 +52,43 @@ class ScanReferDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.dataset_train, batch_size=4, shuffle=True, num_workers=4,
-                          collate_fn=self.dataset_train.collate_fn)
+                          collate_fn=self.dataset_train.collate_fn, drop_last=True)
 
     def val_dataloader(self):
         return DataLoader(self.dataset_val, batch_size=4, shuffle=False, num_workers=4,
-                          collate_fn=self.dataset_val.collate_fn)
+                          collate_fn=self.dataset_val.collate_fn, drop_last=True)
 
     def test_dataloader(self):
         return DataLoader(self.dataset_test, batch_size=1, shuffle=False, num_workers=4,
                           collate_fn=self.dataset_test.collate_fn)
-
+#
 
 # test = ScanReferDataModule()
 # test.prepare_data()
 # test.setup(stage='fit')
 #
+# for i in range(4):
+#     print(test.dataset_train[i]['object_id'])
+#     print(test.dataset_train[i]['instance_id'])
+#
+#
+#
+#
+# # print(test.dataset_train[0]['coord_float'])
+# # print(test.dataset_train[0]['coord_float'].shape)
+# #
+#
 # for i in test.train_dataloader():
-#     print(i['voxel_coords'])
-#     print(i['voxel_coords'].shape)
-#     print(i['voxel_coords'].max(0))
-#     print(i['v2p_map'])
-#     print(i['p2v_map'][:,0].max())
-#     print(i['coords'].max(0))
+#     print(i['instance_id'])
+#     print(i['inst_nums'])
 #     break
 
 # for i in test.train_dataloader():
-#     b=i['coords_float']
+#     print(i['object_id_labels'])
+#     print(i['object_id_labels'].max())
+#     print(i['instance_labels'])
+#     print(i['instance_labels'].max())
+#     a = i['object_id_labels'] == 19
+#     b = i['instance_labels'] == 19
+#     print(False in (a==b))
 #     break
