@@ -187,6 +187,10 @@ class SoftGroup(nn.Module):
                 **self.instance_voxel_cfg)
             instance_batch_idxs, cls_scores, iou_scores, mask_scores, feats = self.forward_instance(
                 inst_feats, inst_map)
+            print(cls_scores)
+            print(iou_scores)
+            print(mask_scores)
+            print(feats.shape)
 
             instance_loss, ious_on_cluster, cls_labels = self.instance_loss(cls_scores, mask_scores, iou_scores,
                                                                             proposals_idx,
@@ -298,6 +302,7 @@ class SoftGroup(nn.Module):
         cls_loss = F.cross_entropy(cls_scores, labels)
         losses['cls_loss'] = cls_loss
 
+        print(labels)
         # compute mask loss
         mask_cls_label = labels[instance_batch_idxs.long()]
         slice_inds = torch.arange(
@@ -377,67 +382,43 @@ class SoftGroup(nn.Module):
         return loss, log_vars
 
     @cuda_cast
-    def forward_test(self, batch_idxs, voxel_coords, p2v_map, v2p_map, coords_float, feats,
-                     semantic_labels, instance_labels, pt_offset_labels, spatial_shape, batch_size,
-                     scan_ids, **kwargs):
-        color_feats = feats
+    def forward_test(self, voxel_coords, p2v_map, v2p_map, coords_float, feats, spatial_shape, batch_size,
+                     scan_ids, batch_idxs, **kwargs):
         if self.with_coords:
             feats = torch.cat((feats, coords_float), 1)
         voxel_feats = voxelization(feats, p2v_map)
         input = spconv.SparseConvTensor(voxel_feats, voxel_coords.int(), spatial_shape, batch_size)
+        semantic_scores, pt_offsets, output_feats = self.forward_backbone(input, v2p_map)
 
-        # lvl_fusion directly use output point as level 1 for pyramid map for fast inference
-        lvl_fusion = getattr(self.test_cfg, 'lvl_fusion', False)
-        semantic_scores, pt_offsets, output_feats = self.forward_backbone(
-            input, v2p_map, x4_split=self.test_cfg.x4_split, lvl_fusion=lvl_fusion)
-        if self.test_cfg.x4_split:
-            coords_float = self.merge_4_parts(coords_float)
-            semantic_labels = self.merge_4_parts(semantic_labels)
-            instance_labels = self.merge_4_parts(instance_labels)
-            pt_offset_labels = self.merge_4_parts(pt_offset_labels)
         semantic_preds = semantic_scores.max(1)[1]
-        ret = dict(scan_id=scan_ids[0])
-        if 'semantic' in self.test_cfg.eval_tasks or 'panoptic' in self.test_cfg.eval_tasks:
-            ret.update(
-                dict(
-                    semantic_labels=semantic_labels.cpu().numpy(),
-                    instance_labels=instance_labels.cpu().numpy()))
-        if 'semantic' in self.test_cfg.eval_tasks:
-            point_wise_results = self.get_point_wise_results(coords_float, color_feats,
-                                                             semantic_preds, pt_offsets,
-                                                             pt_offset_labels, v2p_map, lvl_fusion)
-            ret.update(point_wise_results)
-        if not self.semantic_only:
-            if 'instance' in self.test_cfg.eval_tasks or 'panoptic' in self.test_cfg.eval_tasks:
-                if lvl_fusion:
-                    batch_idxs = input.indices[:, 0].int()
-                    coords_float = voxelization(coords_float, p2v_map)
-                proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(
-                    semantic_scores,
-                    pt_offsets,
-                    batch_idxs,
-                    coords_float,
-                    self.grouping_cfg)
-                inst_feats, inst_map = self.clusters_voxelization(proposals_idx, proposals_offset,
-                                                                  output_feats, coords_float,
-                                                                  **self.instance_voxel_cfg)
-                _, cls_scores, iou_scores, mask_scores, feats = self.forward_instance(inst_feats, inst_map)
-                pred_instances = self.get_instances(
-                    scan_ids[0],
-                    proposals_idx,
-                    semantic_scores,
-                    cls_scores,
-                    iou_scores,
-                    mask_scores,
-                    v2p_map=v2p_map,
-                    lvl_fusion=lvl_fusion)
-            if 'instance' in self.test_cfg.eval_tasks:
-                gt_instances = self.get_gt_instances(semantic_labels, instance_labels)
-                ret.update(dict(pred_instances=pred_instances, gt_instances=gt_instances))
-            if 'panoptic' in self.test_cfg.eval_tasks:
-                panoptic_preds = self.panoptic_fusion(semantic_preds.cpu().numpy(), pred_instances)
-                ret.update(panoptic_preds=panoptic_preds)
-        return ret
+
+        proposals_idx, proposals_offset, proposal_each_scene = self.forward_grouping(
+            semantic_scores,
+            pt_offsets,
+            batch_idxs,
+            coords_float,
+            self.grouping_cfg)
+        inst_feats, inst_map = self.clusters_voxelization(proposals_idx, proposals_offset,
+                                                          output_feats, coords_float,
+                                                          **self.instance_voxel_cfg)
+        _, cls_scores, iou_scores, mask_scores, feats = self.forward_instance(inst_feats, inst_map)
+        print(cls_scores.shape)
+        print(cls_scores.argmax(-1))
+        print(iou_scores.shape)
+        print(mask_scores.shape)
+        print(feats.shape)
+
+        pred_instances = self.get_instances(
+            scan_ids[0],
+            proposals_idx,
+            semantic_scores,
+            cls_scores,
+            iou_scores,
+            mask_scores,
+            v2p_map=v2p_map,
+            lvl_fusion=False)
+
+        return cls_scores, iou_scores, mask_scores, feats, proposals_idx
 
     def forward_backbone(self, input, input_map, x4_split=False, lvl_fusion=False):
         if x4_split:
@@ -636,10 +617,10 @@ class SoftGroup(nn.Module):
         if proposals_idx.size(0) == 0:
             return []
 
-        num_instances = cls_scores.size(0)
-        num_points = semantic_scores.size(0)
-        cls_scores = cls_scores.softmax(1)
-        semantic_pred = semantic_scores.max(1)[1]
+        num_instances = cls_scores.size(0)  # proposal的数量
+        num_points = semantic_scores.size(0)  # 点的数量，这里是50000
+        cls_scores = cls_scores.softmax(1)  # softmax分类得分
+        semantic_pred = semantic_scores.max(1)[1]  # 每个点属于的semantic label（0-19）
         cls_pred_list, score_pred_list, mask_pred_list = [], [], []
         for i in range(self.instance_classes):
             if i in self.sem2ins_classes:
@@ -649,15 +630,15 @@ class SoftGroup(nn.Module):
                 if lvl_fusion:
                     mask_pred = mask_pred[:, v2p_map.long()]
             else:
-                cls_pred = cls_scores.new_full((num_instances,), i + 1, dtype=torch.long)
-                cur_cls_scores = cls_scores[:, i]
-                cur_iou_scores = iou_scores[:, i]
-                cur_mask_scores = mask_scores[:, i]
-                score_pred = cur_cls_scores * cur_iou_scores.clamp(0, 1)
-                mask_pred = torch.zeros((num_instances, num_points), dtype=torch.int, device='cuda')
+                cls_pred = cls_scores.new_full((num_instances,), i + 1, dtype=torch.long)  # Mx1，用i+1填充
+                cur_cls_scores = cls_scores[:, i]  # Mx1
+                cur_iou_scores = iou_scores[:, i]  # Mx1
+                cur_mask_scores = mask_scores[:, i]  # Nx1 N为被group出的点总数
+                score_pred = cur_cls_scores * cur_iou_scores.clamp(0, 1)  # 最终得分
+                mask_pred = torch.zeros((num_instances, num_points), dtype=torch.int, device='cuda')  # Mx50000
                 mask_inds = cur_mask_scores > self.test_cfg.mask_score_thr
                 cur_proposals_idx = proposals_idx[mask_inds].long()
-                mask_pred[cur_proposals_idx[:, 0], cur_proposals_idx[:, 1]] = 1
+                mask_pred[cur_proposals_idx[:, 0], cur_proposals_idx[:, 1]] = 1  # Mx50000，每个proposal的有效点为1
 
                 # filter low score instance
                 inds = cur_cls_scores > self.test_cfg.cls_score_thr

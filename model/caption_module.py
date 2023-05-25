@@ -251,6 +251,56 @@ class CaptionModule(nn.Module):
 
         return data_dict
 
+    def forward_scene_test(self, data_dict, max_len=CONF.TRAIN.MAX_DES_LEN):  # batch size muse be 1
+        sos_embs = data_dict["lang_feat"].flatten().cuda()  # emb_size
+        all_obj_feats = data_dict['final_feats'].cuda()  # num_proposal, feat_size
+        num_proposal = all_obj_feats.shape[0]
+        final_lang = []
+        for i in range(num_proposal):
+            obj_feats = data_dict["final_feats"][i].cuda()  # feat_size
+            combined = all_obj_feats + obj_feats.unsqueeze(dim=0)  # num_proposal, feat_size
+            combined = torch.tanh(combined)
+            scores = self.attend(combined)  # num_proposal, 1
+
+            masks = F.softmax(scores, dim=0)  # num_proposal, 1
+            attended = all_obj_feats * masks
+            attended = attended.sum(0)  # feat_size
+
+            outputs = []
+            hidden = torch.zeros(self.hidden_size).cuda()  # hidden_size
+            cell = torch.zeros(self.hidden_size).cuda()  # hidden_size
+
+            step_id = 0
+            step_input = torch.concat((sos_embs, obj_feats, attended), dim=0)  # input_size
+            while True:
+                # feed
+                step_output, hidden, cell = self.step(step_input, hidden, cell)
+                step_output = self.classifier(step_output)  # num_vocabs
+
+                idx = step_output.argmax()  # 0 ~ num_vocabs
+                word = self.vocabulary["idx2word"][str(idx.item())]
+                emb = torch.FloatTensor(self.embeddings[word]).cuda()  # emb_size
+
+                step_preds = emb  # emb_size
+
+                # store
+                step_output = step_output.unsqueeze(0)  # 1, num_vocabs
+                outputs.append(step_output)
+
+                # next step
+                step_id += 1
+                if step_id == max_len - 1:
+                    break  # exit for no_tf_val mode
+
+                step_input = torch.concat((step_preds, obj_feats, attended), dim=0)  # batch_size, input_size
+
+            outputs = torch.cat(outputs, dim=0)  # max_len, num_vocabs
+            final_lang.append(outputs.unsqueeze(0))  # 1, max_len, num_vocabs
+
+        final_lang = torch.cat(final_lang, dim=0) # num_proposal, max_len, num_vocabs
+        data_dict["final_lang"] = final_lang
+        return data_dict
+
     def forward_scene_batch(self, data_dict, use_tf=False, max_len=CONF.TRAIN.MAX_DES_LEN):
         """
         generate descriptions based on input tokens and object features

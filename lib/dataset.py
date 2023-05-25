@@ -62,7 +62,7 @@ MEAN_COLOR_RGB = np.array([109.8, 97.2, 83.8])
 
 # data path
 SCANNET_V2_TSV = os.path.join(CONF.PATH.SCANNET_META, "scannetv2-labels.combined.tsv")
-# SCANREFER_VOCAB = os.path.join(CONF.PATH.DATA, "ScanRefer_vocabulary.json")
+SCANREFER_VOCAB = os.path.join(CONF.PATH.DATA, "Scanrefer_vocabulary.json")
 VOCAB = os.path.join(CONF.PATH.DATA, "{}_vocabulary.json")  # dataset_name
 # SCANREFER_VOCAB_WEIGHTS = os.path.join(CONF.PATH.DATA, "ScanRefer_vocabulary_weights.json")
 VOCAB_WEIGHTS = os.path.join(CONF.PATH.DATA, "{}_vocabulary_weights.json")  # dataset_name
@@ -86,6 +86,8 @@ def get_scanrefer(model=None):
     # get initial scene list
     train_scene_list = sorted(list(set([data["scene_id"] for data in scanrefer_train])))  # 562 train scenes
     val_scene_list = sorted(list(set([data["scene_id"] for data in scanrefer_eval_val])))  # 141 val scenes
+    test_scene_list = sorted([line.rstrip() for line in open(
+        os.path.join(CONF.PATH.DATA, 'scannet/meta_data/scannetv2_test.txt'))])  # test scenes
 
     # filter data in chosen scenes
     new_scanrefer_train = []
@@ -122,7 +124,7 @@ def get_scanrefer(model=None):
     print("train on {} samples from {} scenes".format(len(new_scanrefer_train), len(train_scene_list)))
     print("eval on {} scenes from train and {} scenes from val".format(len(new_scanrefer_eval_train),
                                                                        len(new_scanrefer_eval_val)))
-    return new_scanrefer_train, new_scanrefer_eval_train, new_scanrefer_eval_val, all_scene_list
+    return new_scanrefer_train, new_scanrefer_eval_train, new_scanrefer_eval_val, all_scene_list, test_scene_list
 
 
 class ReferenceDataset(Dataset):
@@ -879,20 +881,11 @@ class ScannetReferenceDataset(ReferenceDataset):
 
 class ScannetReferenceTestDataset():
 
-    def __init__(self, scanrefer_all_scene,
-                 num_points=40000,
-                 use_height=False,
-                 use_color=False,
-                 use_normal=False,
-                 use_multiview=False):
-
+    def __init__(self, scanrefer_all_scene,num_points=40000):
         self.scanrefer_all_scene = scanrefer_all_scene  # all scene_ids in scanrefer
         self.num_points = num_points
-        self.use_color = use_color
-        self.use_height = use_height
-        self.use_normal = use_normal
-        self.use_multiview = use_multiview
-
+        self.voxel_scale = 50
+        self.spatial_shape = [128, 512]
         # load data
         self.scene_data = self._load_data()
         self.glove = pickle.load(open(GLOVE_PICKLE, "rb"))
@@ -902,50 +895,6 @@ class ScannetReferenceTestDataset():
     def __len__(self):
         return len(self.scanrefer_all_scene)
 
-    def __getitem__(self, idx):
-        start = time.time()
-
-        scene_id = self.scanrefer_all_scene[idx]
-
-        # get pc
-        mesh_vertices = self.scene_data[scene_id]["mesh_vertices"]
-
-        if not self.use_color:
-            point_cloud = mesh_vertices[:, 0:3]  # do not use color for now
-            pcl_color = mesh_vertices[:, 3:6]
-        else:
-            point_cloud = mesh_vertices[:, 0:6]
-            point_cloud[:, 3:6] = (point_cloud[:, 3:6] - MEAN_COLOR_RGB) / 256.0
-            pcl_color = point_cloud[:, 3:6]
-
-        if self.use_normal:
-            normals = mesh_vertices[:, 6:9]
-            point_cloud = np.concatenate([point_cloud, normals], 1)
-
-        if self.use_multiview:
-            # load multiview database
-            pid = mp.current_process().pid
-            if pid not in self.multiview_data:
-                self.multiview_data[pid] = h5py.File(MULTIVIEW_DATA, "r", libver="latest")
-
-            multiview = self.multiview_data[pid][scene_id]
-            point_cloud = np.concatenate([point_cloud, multiview], 1)
-
-        if self.use_height:
-            floor_height = np.percentile(point_cloud[:, 2], 0.99)
-            height = point_cloud[:, 2] - floor_height
-            point_cloud = np.concatenate([point_cloud, np.expand_dims(height, 1)], 1)
-
-        point_cloud, choices = random_sampling(point_cloud, self.num_points, return_choices=True)
-
-        data_dict = {}
-        data_dict["point_clouds"] = point_cloud.astype(np.float32)  # point cloud data including features
-        data_dict["dataset_idx"] = idx
-        data_dict["lang_feat"] = self.glove["sos"].astype(np.float32)  # GloVE embedding for sos token
-        data_dict["load_time"] = time.time() - start
-
-        return data_dict
-
     def _load_data(self):
         scene_data = {}
         for scene_id in self.scanrefer_all_scene:
@@ -954,3 +903,93 @@ class ScannetReferenceTestDataset():
                 os.path.join(CONF.PATH.SCANNET_DATA, scene_id) + "_aligned_vert.npy")  # axis-aligned
 
         return scene_data
+
+    def __getitem__(self, idx):
+        start = time.time()
+        scene_id = self.scanrefer_all_scene[idx]
+
+        # get pc
+        mesh_vertices = self.scene_data[scene_id]["mesh_vertices"]
+        point_cloud = mesh_vertices[:, 0:6].copy()
+        point_cloud[:, 0:3] = np.ascontiguousarray(point_cloud[:, 0:3] - point_cloud[:, 0:3].mean(0))
+        point_cloud[:, 3:6] = (point_cloud[:, 3:6] - MEAN_COLOR_RGB) / 256.0
+
+        coord_float = point_cloud[:, 0:3]
+        coord = coord_float * self.voxel_scale
+        coord = coord - coord.min(0)
+        feat = point_cloud[:, 3:6]
+
+        data_dict = {}
+        data_dict["original_point"] = mesh_vertices
+        data_dict["point_clouds"] = point_cloud.astype(np.float32)  # point cloud data including features
+        data_dict["coord"] = torch.from_numpy(coord).long()  # scale过后的点坐标信息
+        data_dict["coord_float"] = torch.from_numpy(coord_float)  # scale之前的原始点坐标信息
+        data_dict["feat"] = torch.from_numpy(feat).float()  # 点特征信息，这里是rgb color
+        data_dict["dataset_idx"] = idx
+        data_dict["lang_feat"] = torch.from_numpy(self.glove["sos"].astype(np.float32))  # GloVE embedding for sos token
+        data_dict["load_time"] = time.time() - start
+        data_dict['scan_id'] = scene_id
+
+        return data_dict
+
+    def collate_fn(self, batch):
+        scan_ids = []
+        coords = []
+        coords_float = []
+        feats = []
+        batch_id = 0
+
+        for data in batch:
+            if data is None:
+                continue
+            # get data from dataset
+            scan_id = data["scan_id"]
+            coord = data["coord"]
+            coord_float = data["coord_float"]
+            feat = data["feat"]
+
+            # append
+            scan_ids.append(scan_id)
+            coords.append(torch.cat([coord.new_full((coord.size(0), 1), batch_id), coord], 1))
+            coords_float.append(coord_float)
+            feats.append(feat)
+            batch_id += 1
+
+        assert batch_id > 0, 'empty batch'
+        if batch_id < len(batch):
+            print(f'batch is truncated from size {len(batch)} to {batch_id}')
+
+        # merge all the scenes in the batch
+        coords = torch.cat(coords, 0)  # long (N, 1 + 3), the batch item idx is put in coords[:, 0]
+        batch_idxs = coords[:, 0].int()
+        coords_float = torch.cat(coords_float, 0).to(torch.float32)  # float (N, 3)
+        feats = torch.cat(feats, 0)  # float (N, C)
+
+        lang_feat = torch.cat([batch[i]['lang_feat'].unsqueeze(0) for i in range(len(batch))], 0)
+
+        spatial_shape = np.clip(coords.max(0)[0][1:].numpy() + 1, self.spatial_shape[0], None)
+
+        voxel_coords, v2p_map, p2v_map = voxelization_idx(coords, batch_id)
+
+        return {
+            # softgroup need
+            'scan_ids': scan_ids,
+            'coords': coords,
+            'batch_idxs': batch_idxs,
+            'voxel_coords': voxel_coords,
+            'p2v_map': p2v_map,
+            'v2p_map': v2p_map,
+            'coords_float': coords_float,
+            'feats': feats,
+            'spatial_shape': spatial_shape,
+            'batch_size': batch_id,
+
+            # caption module need
+            'lang_feat': lang_feat,
+
+            # visualization need
+            'original_point': batch[0]['original_point']
+        }
+
+
+

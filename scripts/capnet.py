@@ -29,6 +29,8 @@ from lib.capeval.bleu.bleu_scorer import BleuScorer
 sys.path.append(os.path.join(os.getcwd(), "lib"))  # HACK add the lib folder
 from lib.config import CONF
 
+from plyfile import PlyData, PlyElement
+
 vocab_path = os.path.join(CONF.PATH.DATA, "Scanrefer_vocabulary.json")
 GLOVE_PICKLE = os.path.join(CONF.PATH.DATA, "glove.p")
 
@@ -151,7 +153,7 @@ class CapNet(pl.LightningModule):
         return None
 
     def on_validation_end(self):
-        corpus_path = os.path.join(CONF.PATH.OUTPUT,"corpus_val.json")
+        corpus_path = os.path.join(CONF.PATH.OUTPUT, "corpus_val.json")
         if not os.path.exists(corpus_path):
             print("preparing corpus...")
             raw_data = json.load(open(os.path.join(CONF.PATH.DATA, "ScanRefer_filtered_val.json")))
@@ -175,12 +177,12 @@ class CapNet(pl.LightningModule):
         bleu = capblue.Bleu(4).compute_score(corpus, self.candidates)
         cider = capcider.Cider().compute_score(corpus, self.candidates)
         rouge = caprouge.Rouge().compute_score(corpus, self.candidates)
-        self.logger.experiment.add_scalar("bleu-1", bleu[0][0],global_step=self.current_epoch)
-        self.logger.experiment.add_scalar("bleu-2", bleu[0][1],global_step=self.current_epoch)
-        self.logger.experiment.add_scalar("bleu-3", bleu[0][2],global_step=self.current_epoch)
-        self.logger.experiment.add_scalar("bleu-4", bleu[0][3],global_step=self.current_epoch)
-        self.logger.experiment.add_scalar("cider", cider[0],global_step=self.current_epoch)
-        self.logger.experiment.add_scalar("rouge", rouge[0],global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-1", bleu[0][0], global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-2", bleu[0][1], global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-3", bleu[0][2], global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("bleu-4", bleu[0][3], global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("cider", cider[0], global_step=self.current_epoch)
+        self.logger.experiment.add_scalar("rouge", rouge[0], global_step=self.current_epoch)
 
         print(bleu[0])
         print(cider[0])
@@ -218,7 +220,84 @@ class CapNet(pl.LightningModule):
         return optimizer
 
     def test_step(self, batch, batch_idx):
+        cls_scores, iou_scores, mask_scores, feats, proposals_idx = self.softgroup_module.forward(batch,
+                                                                                                  return_loss=False)
+
+        num_points = 50000
+        num_instances = cls_scores.size(0)  # proposal的数量
+        cls_scores = cls_scores.softmax(1)  # softmax分类得分
+
+        final_score = cls_scores * iou_scores.clamp(0, 1)  # Mx19,每个proposal分类的最终得分
+        max_cls_score, final_cls = final_score.max(1)  # Mx1，Mx1，每个proposal得到的分类最高分，以及属于哪个类
+
+        mask_pred = torch.zeros((num_instances, num_points), dtype=torch.int, device='cuda')  # Mx50000
+        for i in range(num_instances):
+            cur_mask_scores = mask_scores[:, final_cls[i]]  # Nx1， N个点对第i个proposal的类的mask score
+            mask_inds = cur_mask_scores > -0.5  # threshold 取mask高于阈值的点
+            cur_proposals_idx = proposals_idx[mask_inds].long()
+            mask_pred[cur_proposals_idx[:, 0], cur_proposals_idx[:, 1]] = 1  # Mx50000， 表示有哪些点可能属于这个proposal对应的cls
+
+        clu_point = torch.zeros((num_instances, num_points), dtype=torch.int, device='cuda')  # Mx50000
+        for i in range(num_instances):
+            clu_point[proposals_idx[:, 0].long(), proposals_idx[:, 1].long()] = 1  # Mx50000, 表示有哪些点被group到这个proposal
+
+        final_proposals = clu_point * mask_pred  # Mx50000，最终结果，最终的proposal中有哪些点
+
+        # 去除分数不高以及被分到background的proposal
+        inds = (max_cls_score > 0.2) * (final_cls != 18)
+        final_proposals = final_proposals[inds]
+        final_feats = feats[inds]
+
+        # 去除点特别少的proposal
+        npoint = final_proposals.sum(1)
+        inds = npoint >= 100
+        final_proposals = final_proposals[inds]
+        final_feats = final_feats[inds]
+
+        print(final_feats.shape)
+        print(final_feats[0].shape)
+        batch['final_feats'] = final_feats
+        batch['final_proposals'] = final_proposals.cpu().numpy()
+
+        batch = self.caption_module.forward_scene_test(batch)
+        captions = batch['final_lang'].argmax(-1)
+        final_result = []
+        for i in range(captions.shape[0]):  # num_proposal
+            dict = {}
+            caption_decoded = decode_caption(captions[i], self.vocabulary["idx2word"])
+            dict['object_id'] = i
+            dict['point'] = batch['final_proposals'][i]
+            dict['caption'] = caption_decoded
+            final_result.append(dict)
+
+        print(final_result)
+        print(batch['scan_ids'])
+        visual(final_result, batch['original_point'])
         return None
+
+
+def visual(final_result, original_point):
+    # 测试，只取第一个
+    for i in range(len(final_result)):
+        idx = np.where(final_result[i]['point'] == 1)
+        object_points = original_point[idx]
+        with open("object{}_verts.obj".format(i), "w") as f:
+            for i in range(object_points.shape[0]):
+                f.write("v {} {} {} {} {} {}\n".format(
+                    object_points[i, 0],
+                    object_points[i, 1],
+                    object_points[i, 2],
+                    object_points[i, 3],
+                    object_points[i, 4],
+                    object_points[i, 5]
+                ))
+
+
+
+    # max = points.max(0)
+    # min = points.min(0)
+
+    return None
 
 # 单个val（用于debug)
 #     def validation_step(self, batch, batch_idx):

@@ -17,6 +17,7 @@
 /scripts/__pycache__
 /model/__pycache__
 /ops/__pycache__
+/model/evaluation/__pycache__/
 
 
 # Pycharm IDE
@@ -32,3 +33,6 @@
 /scripts/model0522_nopretrian_decay_epoch0.ckpt
 /scripts/model0522_pretrian_decay_avgobject_epoch0.ckpt
 /scripts/model0523_pretrain_attention_decay0.ckpt
+/scripts/checkpoints/
+/scripts/model0523_pretrain_attention_decay1.ckpt
+/scripts/model0523_pretrain_attention_decay2.ckpt

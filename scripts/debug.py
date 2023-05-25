@@ -23,13 +23,6 @@ import lib.capeval.rouge.rouge as caprouge
 #
 # print('test' in caption_decoded.keys())
 
-a= torch.rand(4,20,10)
-b = torch.zeros(4,10)
-b[0][9]=1
-b.unsqueeze(dim=1)
+a = torch.rand(10)
 
-# print(b.unsqueeze(dim=1).repeat(1,20,1))
-# print(b.unsqueeze(dim=1).repeat(1,20,1).shape)
-print(a+b.unsqueeze(dim=1))
-print(torch.cat((a,b.unsqueeze(dim=1).repeat(1,20,1)),dim=2))
-
+print(a>0.1)
