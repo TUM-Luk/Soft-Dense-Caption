@@ -12,33 +12,30 @@ data = ScanReferDataModule()
 # create model
 model = CapNet(val_tf_on=False)
 
-model = model.load_from_checkpoint(
-    checkpoint_path='/home/luk/DenseCap/scripts/model0523_pretrain_attention_decay0.ckpt')
+# model = model.load_from_checkpoint(
+#     checkpoint_path='/home/luk/DenseCap/scripts/ppt_model0527_pretrain_gru_decay1.ckpt')
 
-# file = '/home/luk/Downloads/epoch_26.pth'
-# checkpoint = torch.load(file)
-# model.softgroup_module.load_state_dict(checkpoint['net'])
-
-# # freeze sofrgroup
-# for param in model.softgroup_module.parameters():
-#     param.requires_grad = False
+file = '/home/luk/Downloads/epoch_1.pth'
+checkpoint = torch.load(file)
+model.softgroup_module.load_state_dict(checkpoint['net'])
 
 # 创建 ModelCheckpoint 回调
-# checkpoint_callback = ModelCheckpoint(
-#     dirpath='checkpoints',
-#     filename='test_checkpoint_{epoch}_{step}',
-#     save_last=True,  # 保存最后一个检查点
-#     every_n_train_steps=2000  # 每隔 1000 个迭代保存一次
-# )
+checkpoint_callback = ModelCheckpoint(
+    dirpath='checkpoints',
+    filename='test_checkpoint_{epoch}_{step}',
+    save_last=True,  # 保存最后一个检查点
+    every_n_train_steps=2000  # 每隔 2000 个迭代保存一次
+)
 
 # start training
 trainer = pl.Trainer(accelerator='gpu', devices=1, max_epochs=-1,
                      logger=pl.loggers.TensorBoardLogger('logs/'), log_every_n_steps=10,
-                     num_sanity_val_steps=0,limit_test_batches=1)
-#
+                     num_sanity_val_steps=1, limit_test_batches=200, limit_val_batches=1,
+                     callbacks=[checkpoint_callback])
+
 # trainer.fit(model, data)
 
-# # 测试no_tf下的语句生成
+# 测试验证集上的表现
 data.prepare_data()
 data.setup(stage='')
 trainer.test(model, data.test_dataloader())

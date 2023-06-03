@@ -48,7 +48,7 @@ CONF.grouping_cfg.class_numpoint_mean = [-1, -1, 3917., 12056., 2303.,
 # train_cfg
 CONF.train_cfg = EasyDict()
 CONF.train_cfg.max_proposal_num = 1024 #最多有几个proposal
-CONF.train_cfg.pos_iou_thr = 0.5
+CONF.train_cfg.pos_iou_thr = 0.5 # 原始为0.5，用于决定当前instance proposal的gt class应该为什么
 
 # instance_voxel_cfg
 CONF.instance_voxel_cfg = EasyDict()

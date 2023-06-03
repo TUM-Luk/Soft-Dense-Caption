@@ -19,7 +19,7 @@ LABEL_MAP_FILE = 'meta_data/scannetv2-labels.combined.tsv' # using nyu-id
 DONOTCARE_CLASS_IDS = np.array([])
 # OBJ_CLASS_IDS代表需要关注的object classes即labels，例如nyu40id中，1代表wall，2代表floor...则属于这些label的object不再考虑范围内
 OBJ_CLASS_IDS = np.array([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]) # exclude wall (1), floor (2), ceiling (22)
-MAX_NUM_POINT = 50000
+MAX_NUM_POINT = 100000
 OUTPUT_FOLDER = './scannet_data'
 
 def export_one_scan(scan_name, output_filename_prefix):    

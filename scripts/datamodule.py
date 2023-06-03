@@ -13,6 +13,7 @@ sys.path.append(os.path.join(os.getcwd(), "lib"))  # HACK add the lib folder
 class ScanReferDataModule(pl.LightningDataModule):
     def __init__(self):
         super().__init__()
+        self.Scanrefer_eval_val_scene = None
         self.dataset_val = None
         self.dataset_test = None
         self.dataset_train = None
@@ -23,7 +24,7 @@ class ScanReferDataModule(pl.LightningDataModule):
         self.Scanrefer_train = None
 
     def prepare_data(self):
-        self.Scanrefer_train, self.Scanrefer_eval_train, self.Scanrefer_eval_val, self.all_scene_list, self.test_scene_list = get_scanrefer(
+        self.Scanrefer_train, self.Scanrefer_eval_train, self.Scanrefer_eval_val, self.all_scene_list, self.Scanrefer_eval_val_scene = get_scanrefer(
             model='')
 
     def setup(self, stage: str):
@@ -43,13 +44,16 @@ class ScanReferDataModule(pl.LightningDataModule):
         )
 
         # test要改的
-        self.dataset_test = ScannetReferenceTestDataset(
-            scanrefer_all_scene=self.test_scene_list,
+        self.dataset_test = ScannetReferenceDataset(
+            scanrefer=self.Scanrefer_eval_val_scene,
+            scanrefer_all_scene=self.all_scene_list,
+            split='val',
             num_points=40000,
+            augment=False,
         )
 
     def train_dataloader(self):
-        return DataLoader(self.dataset_train, batch_size=1, shuffle=False, num_workers=4,
+        return DataLoader(self.dataset_train, batch_size=4, shuffle=True, num_workers=4,
                           collate_fn=self.dataset_train.collate_fn, drop_last=True)
 
     def val_dataloader(self):
@@ -67,11 +71,19 @@ class ScanReferDataModule(pl.LightningDataModule):
 # test.prepare_data()
 # test.setup(stage='fit')
 #
-# for i in test.test_dataloader():
-#     print(i['batch_idxs'])
-#     print(i['batch_idxs'].shape)
+# print(test.dataset_test[0])
+# print(len(test.dataset_test))
+
+# print(test.dataset_train.scene_data['scene0394_00']['instance_labels'])
+# print(test.dataset_train.scene_data['scene0394_00']['instance_labels'].max())
+# print(test.dataset_train.scene_data['scene0394_00']['instance_labels'].size)
+# print(test.dataset_train.scene_data['scene0497_00']['instance_labels'].size)
+# for i in test.train_dataloader():
+#     print(i['scan_ids'])
+#     print(i['instance_id'])
 #     break
-#
+
+
 # for i in test.train_dataloader():
 #     print(i['batch_idxs'])
 #     print(i['batch_idxs'].shape)

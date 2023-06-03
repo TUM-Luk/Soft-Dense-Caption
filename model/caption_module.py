@@ -52,9 +52,6 @@ class CaptionModule(nn.Module):
         self.hidden_size = hidden_size
         self.num_proposals = num_proposals
 
-        # attention layer
-        self.attend = nn.Linear(feat_size, 1, bias=False)
-
         # transform the object_feature to higher_dimension
         self.map_feat = nn.Sequential(
             nn.Linear(feat_size, emb_size),
@@ -62,17 +59,17 @@ class CaptionModule(nn.Module):
         )
 
         # captioning core 主体部分
-        self.recurrent_cell = nn.LSTMCell(
-            input_size=emb_size + feat_size + feat_size,  # word vector + clus feature + avg_obj_feature
-            hidden_size=hidden_size,
+        self.recurrent_cell = nn.GRUCell(
+            input_size=emb_size,
+            hidden_size=emb_size
         )
         # 输出分类层
-        self.classifier = nn.Linear(hidden_size, self.num_vocabs)
+        self.classifier = nn.Linear(emb_size, self.num_vocabs)
 
-    def step(self, step_input, hidden, cell):
-        (hidden, cell) = self.recurrent_cell(step_input, (hidden, cell))  # num_proposals, hidden_size
+    def step(self, step_input, hidden):
+        hidden = self.recurrent_cell(step_input, hidden)  # num_proposals, emb_size
 
-        return hidden, hidden, cell
+        return hidden, hidden
 
     def compute_loss(self, data_dict):
         pred_caps = data_dict['lang_cap']  # (B, num_words - 1, num_vocabs)
@@ -125,40 +122,23 @@ class CaptionModule(nn.Module):
         word_embs = data_dict["lang_feat"].cuda()  # batch_size, max_len, emb_size
         des_lens = data_dict["lang_len"].cuda()  # batch_size
         obj_feats = data_dict["select_feats"].cuda()  # batch_size, feat_size
-        all_obj_feats = data_dict['object_feats'].cuda()  # batch_size, num_proposal, feat_size
-        object_mask = data_dict['object_mask'].cuda()  # batch_size, num_proposal
-
-        object_mask = torch.unsqueeze(object_mask, dim=2)  # batch_size, num_proposal, 1
-
-        # avg_obj_feats = torch.sum(all_obj_feats * object_mask, dim=1)  # batch_size, feat_size
-        # avg_obj_feats = avg_obj_feats / (torch.sum(object_mask, dim=1) + 1e-6)  # batch_size, feat_size
-
-        combined = all_obj_feats + obj_feats.unsqueeze(dim=1)  # batch_size, num_proposal, feat_size
-        combined = torch.tanh(combined)
-        scores = self.attend(combined)  # batch_size, num_proposal, 1
-        scores.masked_fill_(object_mask == 0, float('-1e30'))
-
-        masks = F.softmax(scores, dim=1)  # batch_size, num_proposal, 1
-        attended = all_obj_feats * masks
-        attended = attended.sum(1)  # batch_size, feat_size
 
         num_words = des_lens.max()
         batch_size = des_lens.shape[0]
 
         # transform the features
-        # obj_feats = self.map_feat(obj_feats)  # batch_size, emb_size
-        # obj_feats = obj_feats.cuda()
+        obj_feats = self.map_feat(obj_feats)  # batch_size, emb_size
+        obj_feats = obj_feats.cuda()
 
         # recurrent from 0 to max_len - 2
         outputs = []
-        hidden = torch.zeros(batch_size, self.hidden_size).cuda()  # batch_size, hidden_size
-        cell = torch.zeros(batch_size, self.hidden_size).cuda()  # batch_size, hidden_size
+        hidden = obj_feats  # batch,size, emb_size
         step_id = 0
-        step_input = torch.concat((word_embs[:, step_id], obj_feats, attended),
-                                  dim=1)  # batch_size, input_size(300+32+32)
+        step_input = word_embs[:, step_id]  # batch_size, emb_size
+
         while True:
             # feed
-            step_output, hidden, cell = self.step(step_input, hidden, cell)
+            step_output, hidden, = self.step(step_input, hidden)
             step_output = self.classifier(step_output)  # batch_size, num_vocabs
 
             # store
@@ -169,8 +149,7 @@ class CaptionModule(nn.Module):
             step_id += 1
             if step_id == num_words - 1:
                 break  # exit for train mode
-            step_input = torch.concat((word_embs[:, step_id], obj_feats, attended),
-                                      dim=1)  # batch_size, input_size
+            step_input = word_embs[:, step_id]  # batch_size, emb_size
 
         outputs = torch.cat(outputs, dim=1)  # batch_size, num_words - 1/max_len, num_vocabs
 
@@ -184,39 +163,23 @@ class CaptionModule(nn.Module):
         word_embs = data_dict["lang_feat"].cuda()  # batch_size, max_len, emb_size
         des_lens = data_dict["lang_len"].cuda()  # batch_size
         obj_feats = data_dict["select_feats"].cuda()  # batch_size, feat_size
-        all_obj_feats = data_dict['object_feats'].cuda()  # batch_size, num_proposal, feat_size
-        object_mask = data_dict['object_mask'].cuda()  # batch_size, num_proposal
-
-        object_mask = torch.unsqueeze(object_mask, dim=2)  # batch_size, num_proposal, 1
-
-        # avg_obj_feats = torch.sum(all_obj_feats * object_mask, dim=1)  # batch_size, feat_size
-        # avg_obj_feats = avg_obj_feats / (torch.sum(object_mask, dim=1) + 1e-6)  # batch_size, feat_size
-
-        combined = all_obj_feats + obj_feats.unsqueeze(dim=1)  # batch_size, num_proposal, feat_size
-        combined = torch.tanh(combined)
-        scores = self.attend(combined)  # batch_size, num_proposal, 1
-        scores.masked_fill_(object_mask == 0, float('-1e30'))
-
-        masks = F.softmax(scores, dim=1)  # batch_size, num_proposal, 1
-        attended = all_obj_feats * masks
-        attended = attended.sum(1)  # batch_size, feat_size
 
         num_words = des_lens.max()
         batch_size = des_lens.shape[0]
 
         # transform the features
-        # obj_feats = self.map_feat(obj_feats)  # batch_size, emb_size
-        # obj_feats = obj_feats.cuda()
+        obj_feats = self.map_feat(obj_feats)  # batch_size, emb_size
+        obj_feats = obj_feats.cuda()
 
         # recurrent from 0 to max_len - 2
         outputs = []
-        hidden = torch.zeros(batch_size, self.hidden_size).cuda()  # batch_size, hidden_size
-        cell = torch.zeros(batch_size, self.hidden_size).cuda()  # batch_size, hidden_size
+        hidden = obj_feats  # batch,size, emb_size
         step_id = 0
-        step_input = torch.concat((word_embs[:, step_id], obj_feats, attended), dim=1)  # batch_size, input_size
+        step_input = word_embs[:, step_id]  # batch_size, emb_size
+
         while True:
             # feed
-            step_output, hidden, cell = self.step(step_input, hidden, cell)
+            step_output, hidden = self.step(step_input, hidden)
             step_output = self.classifier(step_output)  # batch_size, num_vocabs
 
             # predicted word
@@ -241,46 +204,37 @@ class CaptionModule(nn.Module):
                 break  # exit for no_tf_val mode
 
             if use_tf:
-                step_input = torch.concat((word_embs[:, step_id], obj_feats, attended),
-                                          dim=1)  # batch_size, input_size
+                step_input = word_embs[:, step_id]
             if not use_tf:
-                step_input = torch.concat((step_preds, obj_feats, attended), dim=1)  # batch_size, input_size
+                step_input = step_preds  # batch_size, input_size
 
         outputs = torch.cat(outputs, dim=1)  # batch_size, num_words - 1/max_len, num_vocabs
         data_dict["lang_cap"] = outputs
 
         return data_dict
 
-    def forward_scene_test(self, data_dict, max_len=CONF.TRAIN.MAX_DES_LEN):  # batch size muse be 1
-        sos_embs = data_dict["lang_feat"].flatten().cuda()  # emb_size
+    def forward_scene_test(self, data_dict, max_len=CONF.TRAIN.MAX_DES_LEN):  # batch size must be 1
+        word_embs = data_dict["lang_feat"].cuda()  # 1, emb_size
         all_obj_feats = data_dict['final_feats'].cuda()  # num_proposal, feat_size
         num_proposal = all_obj_feats.shape[0]
         final_lang = []
+
         for i in range(num_proposal):
             obj_feats = data_dict["final_feats"][i].cuda()  # feat_size
-            combined = all_obj_feats + obj_feats.unsqueeze(dim=0)  # num_proposal, feat_size
-            combined = torch.tanh(combined)
-            scores = self.attend(combined)  # num_proposal, 1
-
-            masks = F.softmax(scores, dim=0)  # num_proposal, 1
-            attended = all_obj_feats * masks
-            attended = attended.sum(0)  # feat_size
-
+            obj_feats = self.map_feat(obj_feats)  # emb_size
             outputs = []
-            hidden = torch.zeros(self.hidden_size).cuda()  # hidden_size
-            cell = torch.zeros(self.hidden_size).cuda()  # hidden_size
+            hidden = obj_feats  # emb_size
 
             step_id = 0
-            step_input = torch.concat((sos_embs, obj_feats, attended), dim=0)  # input_size
+            step_input = word_embs[:, step_id].flatten()  # input_size
             while True:
                 # feed
-                step_output, hidden, cell = self.step(step_input, hidden, cell)
+                step_output, hidden = self.step(step_input, hidden)
                 step_output = self.classifier(step_output)  # num_vocabs
 
                 idx = step_output.argmax()  # 0 ~ num_vocabs
                 word = self.vocabulary["idx2word"][str(idx.item())]
                 emb = torch.FloatTensor(self.embeddings[word]).cuda()  # emb_size
-
                 step_preds = emb  # emb_size
 
                 # store
@@ -292,12 +246,12 @@ class CaptionModule(nn.Module):
                 if step_id == max_len - 1:
                     break  # exit for no_tf_val mode
 
-                step_input = torch.concat((step_preds, obj_feats, attended), dim=0)  # batch_size, input_size
+                step_input = step_preds  # input_size
 
             outputs = torch.cat(outputs, dim=0)  # max_len, num_vocabs
             final_lang.append(outputs.unsqueeze(0))  # 1, max_len, num_vocabs
 
-        final_lang = torch.cat(final_lang, dim=0) # num_proposal, max_len, num_vocabs
+        final_lang = torch.cat(final_lang, dim=0)  # num_proposal, max_len, num_vocabs
         data_dict["final_lang"] = final_lang
         return data_dict
 
